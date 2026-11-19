@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Core, ElementDefinition } from 'cytoscape'
 import type { GraphMode, RepositoryGraphData, RepositoryGraphNode, RepositorySource, RepositorySummary } from './types'
-import { checkApiHealth, deleteRepository, getAnalysisJob, getRepositories, getRepositoryFile, getRepositoryGraph, loginWithGitHub, loginWithGoogle, logout, RepositoryApiError, requestEmailCode, saveRepository, startBrowserSession, startRepositoryAnalysis, verifyEmailCode } from './services/repositoryApi'
+import { checkApiHealth, confirmTwoFactorEnrollment, deleteRepository, getAccountSettings, getAnalysisJob, getRepositories, getRepositoryFile, getRepositoryGraph, loginWithEmail, loginWithGitHub, loginWithGoogle, logout, registerEmailAccount, RepositoryApiError, saveRepository, startBrowserSession, startRepositoryAnalysis, updateTwoFactor, verifyEmailSignup, verifyEmailTwoFactor, type AccountSettings } from './services/repositoryApi'
 import { askWithEvidence, type AssistantSettings, type EvidenceCitation } from './services/evidenceAssistant'
 import {
   ArrowDown, ArrowRight, ArrowsOut, BookOpenText,
@@ -200,10 +200,20 @@ function App() {
   const [emailAuthConfigured, setEmailAuthConfigured] = useState(false)
   const [showAuth, setShowAuth] = useState(false)
   const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authPasswordConfirm, setAuthPasswordConfirm] = useState('')
   const [authCode, setAuthCode] = useState('')
-  const [authStep, setAuthStep] = useState<'email' | 'code'>('email')
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin')
+  const [authStep, setAuthStep] = useState<'credentials' | 'signup-code' | 'two-factor'>('credentials')
   const [authBusy, setAuthBusy] = useState(false)
   const [authMessage, setAuthMessage] = useState('')
+  const [showAccountSettings, setShowAccountSettings] = useState(false)
+  const [accountInfo, setAccountInfo] = useState<AccountSettings | null>(null)
+  const [accountPassword, setAccountPassword] = useState('')
+  const [accountMessage, setAccountMessage] = useState('')
+  const [accountBusy, setAccountBusy] = useState(false)
+  const [twoFactorEnrollment, setTwoFactorEnrollment] = useState(false)
+  const [twoFactorCode, setTwoFactorCode] = useState('')
   const [activeIsSaved, setActiveIsSaved] = useState(false)
   const [liveGraph, setLiveGraph] = useState<RepositoryGraphData | null>(null)
   const [graphLoading, setGraphLoading] = useState(false)
@@ -421,21 +431,51 @@ function App() {
   }
 
   const openAuthDialog = () => {
-    setAuthStep('email')
+    setAuthMode('signin')
+    setAuthStep('credentials')
+    setAuthPassword('')
+    setAuthPasswordConfirm('')
+    setAuthCode('')
     setAuthMessage('')
     setShowAuth(true)
   }
 
-  const handleRequestEmailCode = async (event: React.FormEvent<HTMLFormElement>) => {
+  const completeEmailSignIn = (login: string) => {
+    setGithubLogin(login)
+    setShowAuth(false)
+    setNotice(`Signed in as ${login}. You can now choose which indexes to save.`)
+    setAuthMessage('')
+    void getRepositories().then(setSavedRepositories).catch(() => { /* sign-in remains available without saved-index refresh */ })
+  }
+
+  const handleEmailSignup = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (authPassword !== authPasswordConfirm) { setAuthMessage('Passwords do not match.'); return }
+    setAuthBusy(true)
+    try {
+      const result = await registerEmailAccount(authEmail.trim(), authPassword)
+      setAuthStep('signup-code')
+      setAuthCode('')
+      setAuthMessage(result.message)
+    } catch (error) {
+      setAuthMessage(error instanceof Error ? error.message : 'Email signup could not be started.')
+    } finally { setAuthBusy(false) }
+  }
+
+  const handleEmailLogin = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setAuthBusy(true)
     try {
-      await requestEmailCode(authEmail.trim())
-      setAuthStep('code')
-      setAuthCode('')
-      setAuthMessage('If the address can receive mail, a sign-in code is on its way.')
+      const session = await loginWithEmail(authEmail.trim(), authPassword)
+      if (session.requires_2fa) {
+        setAuthStep('two-factor')
+        setAuthCode('')
+        setAuthMessage(`A sign-in code was sent to ${session.login}.`)
+      } else {
+        completeEmailSignIn(session.login)
+      }
     } catch (error) {
-      setAuthMessage(error instanceof Error ? error.message : 'The sign-in code could not be sent.')
+      setAuthMessage(error instanceof Error ? error.message : 'Email sign-in failed.')
     } finally { setAuthBusy(false) }
   }
 
@@ -443,15 +483,61 @@ function App() {
     event.preventDefault()
     setAuthBusy(true)
     try {
-      const session = await verifyEmailCode(authEmail.trim(), authCode.trim())
-      setGithubLogin(session.login)
-      setShowAuth(false)
-      setNotice(`Signed in as ${session.login}. You can now choose which indexes to save.`)
-      setAuthMessage('')
-      void getRepositories().then(setSavedRepositories).catch(() => { /* sign-in remains available without saved-index refresh */ })
+      const session = authStep === 'signup-code'
+        ? await verifyEmailSignup(authEmail.trim(), authCode.trim())
+        : await verifyEmailTwoFactor(authEmail.trim(), authCode.trim())
+      completeEmailSignIn(session.login)
     } catch (error) {
-      setAuthMessage(error instanceof Error ? error.message : 'That sign-in code could not be verified.')
+      setAuthMessage(error instanceof Error ? error.message : 'That code could not be verified.')
     } finally { setAuthBusy(false) }
+  }
+
+  const openAccountSettings = async () => {
+    setAccountMessage('Loading account settings…')
+    setAccountPassword('')
+    setShowAccountSettings(true)
+    try {
+      setAccountInfo(await getAccountSettings())
+      setAccountMessage('')
+    } catch (error) {
+      setAccountMessage(error instanceof Error ? error.message : 'Account settings could not be loaded.')
+    }
+  }
+
+  const handleToggleTwoFactor = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!accountInfo) return
+    setAccountBusy(true)
+    setAccountMessage('')
+    try {
+      const result = await updateTwoFactor(!accountInfo.two_factor_enabled, accountPassword)
+      setAccountPassword('')
+      if (result.enrollment_required) {
+        setTwoFactorEnrollment(true)
+        setTwoFactorCode('')
+        setAccountMessage(`A setup code was sent to ${accountInfo.email}. Enter it below to enable two-step verification.`)
+      } else {
+        setAccountInfo({ ...accountInfo, two_factor_enabled: result.two_factor_enabled })
+        setTwoFactorEnrollment(false)
+        setAccountMessage('Email two-step verification is disabled.')
+      }
+    } catch (error) {
+      setAccountMessage(error instanceof Error ? error.message : 'The security setting could not be updated.')
+    } finally { setAccountBusy(false) }
+  }
+
+  const handleConfirmTwoFactorEnrollment = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setAccountBusy(true)
+    try {
+      await confirmTwoFactorEnrollment(twoFactorCode)
+      setAccountInfo((current) => current ? { ...current, two_factor_enabled: true } : current)
+      setTwoFactorEnrollment(false)
+      setTwoFactorCode('')
+      setAccountMessage('Email two-step verification is enabled.')
+    } catch (error) {
+      setAccountMessage(error instanceof Error ? error.message : 'The setup code could not be verified.')
+    } finally { setAccountBusy(false) }
   }
 
   const handleSaveIndex = async () => {
@@ -461,7 +547,7 @@ function App() {
       await saveRepository(activeRepository.owner, activeRepository.repository)
       setActiveIsSaved(true)
       setSavedRepositories(await getRepositories())
-      setNotice(`${activeRepository.fullName} is saved to your GitHub account.`)
+      setNotice(`${activeRepository.fullName} is saved to your account.`)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'This index could not be saved.')
     }
@@ -471,6 +557,7 @@ function App() {
     try {
       await logout()
       setGithubLogin(null)
+      setShowAccountSettings(false)
       setActiveIsSaved(false)
       setSavedRepositories([])
       setWorkspace(false)
@@ -554,7 +641,7 @@ function App() {
       {!workspace ? <section className="landing">
         <header className="landing-nav">
           <a className="brand" href="#top" aria-label="Why home"><span className="brand-mark"><Graph size={17} weight="bold" /></span><span>why<span className="brand-period">.</span></span></a>
-          <div className="nav-right"><span className="nav-status"><span className={`status-dot ${apiHealth?.ready ? '' : 'muted-dot'}`} /> {apiHealth?.ready ? 'Neo4j graph ready' : 'Evidence-first analysis'}</span>{githubLogin ? <button className="nav-link" onClick={() => void handleLogout()}>@{githubLogin} · Sign out</button> : <button className="nav-link" onClick={openAuthDialog}>Sign in</button>}<button className="nav-link" onClick={handleDemo}>Explore sample <ArrowRight size={15} /></button></div>
+          <div className="nav-right"><span className="nav-status"><span className={`status-dot ${apiHealth?.ready ? '' : 'muted-dot'}`} /> {apiHealth?.ready ? 'Neo4j graph ready' : 'Evidence-first analysis'}</span>{githubLogin ? <button className="nav-link" onClick={() => void openAccountSettings()}>@{githubLogin} · Account</button> : <button className="nav-link" onClick={openAuthDialog}>Sign in</button>}<button className="nav-link" onClick={handleDemo}>Explore sample <ArrowRight size={15} /></button></div>
         </header>
         <div className="landing-grid" id="top">
           <section className="hero-copy">
@@ -566,11 +653,11 @@ function App() {
               <input aria-label="Public GitHub repository URL" value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} placeholder="github.com/owner/repository" />
               <button type="submit" disabled={isIndexing}>{isIndexing ? `Indexing ${indexProgress.progress}%` : <>Analyze repo <ArrowRight size={16} /></>}</button>
             </form>
-            <label className="storage-consent"><input type="checkbox" checked={storageConsent} onChange={(event) => setStorageConsent(event.target.checked)} /><span>I agree that this app reads a bounded subset of public files and GitHub history, then temporarily stores file paths, relationships, and history records in its configured Neo4j database. Source file contents are not stored there. You can explicitly save an index to your GitHub account; otherwise it is deleted when you leave or after two hours of inactivity.</span></label>
-            <div className="form-caption"><ShieldCheck size={15} /> Read-only · No code execution · Saving requires GitHub sign-in and your explicit action</div>
+            <label className="storage-consent"><input type="checkbox" checked={storageConsent} onChange={(event) => setStorageConsent(event.target.checked)} /><span>I agree that this app reads a bounded subset of public files and GitHub history, then temporarily stores file paths, relationships, and history records in its configured Neo4j database. Source file contents are not stored there. You can explicitly save an index to your account; otherwise it is deleted when you leave or after two hours of inactivity.</span></label>
+            <div className="form-caption"><ShieldCheck size={15} /> Read-only · No code execution · Saving requires sign-in and your explicit action</div>
             {isIndexing && <div className="index-progress" role="status"><div className="progress-track"><span style={{ width: `${indexProgress.progress}%` }} /></div><span>{indexProgress.message}</span></div>}
             <button className="folder-entry" onClick={() => setNotice('Folder import will be available in the native app. The web version analyzes public GitHub repositories.')}> <FolderSimple size={17} /> Working with a local clone? <span>Import folder in the desktop app <ArrowRight size={14} /></span></button>
-            {savedRepositories.length > 0 && <section className="saved-repositories" aria-label="Saved and temporary repository indexes"><div className="saved-repositories-head"><b>YOUR REPOSITORY INDEXES</b><span>SAVED: {savedRepositories.filter((item) => item.is_saved).length} · TEMPORARY: {savedRepositories.filter((item) => !item.is_saved).length}</span></div>{savedRepositories.slice(0, 8).map((repository) => <button className="saved-repository" key={repository.full_name} onClick={() => openSavedRepository(repository)}><span className="saved-repository-icon"><GithubLogo size={14} weight="fill" /></span><span><b>{repository.full_name}</b><small>{repository.is_saved ? 'Saved to your GitHub account' : 'Temporary · expires after inactivity'} · {repository.default_branch}</small></span><ArrowRight size={14} /></button>)}</section>}
+            {savedRepositories.length > 0 && <section className="saved-repositories" aria-label="Saved and temporary repository indexes"><div className="saved-repositories-head"><b>YOUR REPOSITORY INDEXES</b><span>SAVED: {savedRepositories.filter((item) => item.is_saved).length} · TEMPORARY: {savedRepositories.filter((item) => !item.is_saved).length}</span></div>{savedRepositories.slice(0, 8).map((repository) => <button className="saved-repository" key={repository.full_name} onClick={() => openSavedRepository(repository)}><span className="saved-repository-icon"><GithubLogo size={14} weight="fill" /></span><span><b>{repository.full_name}</b><small>{repository.is_saved ? 'Saved to your account' : 'Temporary · expires after inactivity'} · {repository.default_branch}</small></span><ArrowRight size={14} /></button>)}</section>}
             {notice && !workspace && <p className="notice" role="status">{notice}</p>}
             <div className="hero-proof"><div className="proof-avatars"><span>G</span><span>↗</span><span>∷</span></div><span>For the code we inherit<br /><strong>and the context we lose.</strong></span></div>
           </section>
@@ -605,7 +692,7 @@ function App() {
         <header className="workspace-topbar">
           <a className="brand" href="#top" onClick={(event) => { event.preventDefault(); leaveCurrentRepository() }}><span className="brand-mark"><Graph size={16} weight="bold" /></span><span>why<span className="brand-period">.</span></span></a>
           <div className="repo-crumb"><span className="crumb-slash">/</span><GithubLogo size={15} weight="fill" /><b>{activeRepository?.fullName ?? 'vercel / next.js'}</b><span className="sample-tag">{activeRepository ? 'INDEXED' : 'SAMPLE'}</span><CaretDown size={13} /></div>
-          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? activeIsSaved ? 'Saved index' : 'Temporary index' : 'Preview data only'}</span>{activeRepository && !activeIsSaved && <button className="topbar-save" onClick={() => void handleSaveIndex()}>{githubLogin ? 'Save index' : 'Sign in to save'}</button>}{githubLogin && <button className="topbar-account" onClick={() => void handleLogout()}>@{githubLogin}</button>}{activeRepository && <button className="topbar-icon" aria-label="Remove repository index" title="Remove repository graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={leaveCurrentRepository}><Plus size={16} /> New repo</button></div>
+          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? activeIsSaved ? 'Saved index' : 'Temporary index' : 'Preview data only'}</span>{activeRepository && !activeIsSaved && <button className="topbar-save" onClick={() => void handleSaveIndex()}>{githubLogin ? 'Save index' : 'Sign in to save'}</button>}{githubLogin && <button className="topbar-account" onClick={() => void openAccountSettings()} title="Account settings">@{githubLogin}</button>}{activeRepository && <button className="topbar-icon" aria-label="Remove repository index" title="Remove repository graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={leaveCurrentRepository}><Plus size={16} /> New repo</button></div>
         </header>
         <div className="workspace-body">
           <aside className="left-rail">
@@ -630,7 +717,7 @@ function App() {
               <button className="graph-expand" aria-label="Fit graph" onClick={() => { const instance = document.querySelector('.graph-canvas'); instance?.dispatchEvent(new Event('fitgraph')) }}><ArrowsOut size={16} /></button>
               <div className="graph-zoom"><button onClick={() => document.querySelector('.graph-canvas')?.dispatchEvent(new Event('zoom-in'))}>+</button><span>100%</span><button onClick={() => document.querySelector('.graph-canvas')?.dispatchEvent(new Event('zoom-out'))}>−</button></div>
             </div>
-            <div className="graph-footnote"><span><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? activeIsSaved ? `Saved index · ${activeRepository.fullName} · private to your GitHub account` : `Temporary index · ${activeRepository.fullName} · deleted on exit or after inactivity` : 'Illustrative sample · repository data not yet indexed'}</span><span>DRAG TO PAN <i /> SCROLL TO ZOOM</span></div>
+            <div className="graph-footnote"><span><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? activeIsSaved ? `Saved index · ${activeRepository.fullName} · private to your account` : `Temporary index · ${activeRepository.fullName} · deleted on exit or after inactivity` : 'Illustrative sample · repository data not yet indexed'}</span><span>DRAG TO PAN <i /> SCROLL TO ZOOM</span></div>
           </section>
           <aside className="inspector">
             <div className="inspector-tabs"><button className={activeSource === 'code' ? 'active' : ''} onClick={() => setActiveSource('code')}>Explore</button><button className={activeSource === 'assistant' ? 'active' : ''} onClick={() => setActiveSource('assistant')}>Assistant <Sparkle size={13} /></button><button className="inspector-close" aria-label="Close panel"><X size={16} /></button></div>
@@ -669,20 +756,51 @@ function App() {
           <button className="auth-provider" disabled={!githubOAuthConfigured} onClick={loginWithGitHub}><GithubLogo size={17} weight="fill" /> Continue with GitHub {!githubOAuthConfigured && <small>Not configured</small>}</button>
           <button className="auth-provider" disabled={!googleOAuthConfigured} onClick={loginWithGoogle}><GoogleLogo size={17} /> Continue with Google {!googleOAuthConfigured && <small>Not configured</small>}</button>
           <div className="auth-divider"><span />or use email<span /></div>
-          {authStep === 'email' ? <form className="auth-email-form" onSubmit={(event) => void handleRequestEmailCode(event)}>
-            <label htmlFor="auth-email">Email address</label>
-            <input id="auth-email" type="email" autoComplete="email" required maxLength={254} value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" disabled={!emailAuthConfigured || authBusy} />
-            {!emailAuthConfigured && <small>Email sign-in becomes available after SMTP is configured.</small>}
-            <button className="auth-submit" type="submit" disabled={!emailAuthConfigured || authBusy || !authEmail.trim()}>{authBusy ? 'Sending code…' : 'Email me a sign-in code'}</button>
-            <small>First time? A verified email code creates your account. Returning users can use the same flow.</small>
-          </form> : <form className="auth-email-form" onSubmit={(event) => void handleVerifyEmailCode(event)}>
-            <label htmlFor="auth-code">6-digit code sent to {authEmail}</label>
+          {authStep === 'credentials' ? <>
+            <div className="auth-mode-tabs"><button className={authMode === 'signin' ? 'active' : ''} onClick={() => { setAuthMode('signin'); setAuthMessage('') }}>Sign in</button><button className={authMode === 'signup' ? 'active' : ''} disabled={!emailAuthConfigured} onClick={() => { setAuthMode('signup'); setAuthMessage('') }}>Create account</button></div>
+            <form className="auth-email-form" onSubmit={(event) => void (authMode === 'signup' ? handleEmailSignup(event) : handleEmailLogin(event))}>
+              <label htmlFor="auth-email">Email address</label>
+              <input id="auth-email" type="email" autoComplete="email" required maxLength={254} value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" disabled={authBusy} />
+              <label htmlFor="auth-password">Password</label>
+              <input id="auth-password" type="password" autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'} required minLength={authMode === 'signup' ? 12 : 1} maxLength={128} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder={authMode === 'signup' ? 'At least 12 characters' : 'Your password'} disabled={authBusy} />
+              {authMode === 'signup' && <><label htmlFor="auth-password-confirm">Confirm password</label><input id="auth-password-confirm" type="password" autoComplete="new-password" required minLength={12} maxLength={128} value={authPasswordConfirm} onChange={(event) => setAuthPasswordConfirm(event.target.value)} placeholder="Enter it again" disabled={authBusy} />{!emailAuthConfigured && <small>Email signup is unavailable until SMTP is configured.</small>}</>}
+              <button className="auth-submit" type="submit" disabled={authBusy || !authEmail.trim() || !authPassword || (authMode === 'signup' && (!emailAuthConfigured || !authPasswordConfirm))}>{authBusy ? 'Please wait…' : authMode === 'signup' ? 'Create email account' : 'Sign in with email'}</button>
+              <small>{authMode === 'signup' ? 'We’ll email a one-time code to verify your address before creating the account. Your email and password hash are stored in the connected database.' : 'Email accounts can enable a sign-in code in Account settings.'}</small>
+            </form>
+          </> : <form className="auth-email-form" onSubmit={(event) => void handleVerifyEmailCode(event)}>
+            <label htmlFor="auth-code">{authStep === 'signup-code' ? `Verification code sent to ${authEmail}` : `Sign-in code sent to ${authEmail}`}</label>
             <input id="auth-code" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} required value={authCode} onChange={(event) => setAuthCode(event.target.value.replace(/\D/g, '').slice(0, 6))} placeholder="000000" disabled={authBusy} />
-            <button className="auth-submit" type="submit" disabled={authBusy || authCode.length !== 6}>{authBusy ? 'Verifying…' : 'Verify and sign in'}</button>
-            <button type="button" className="auth-back" onClick={() => setAuthStep('email')} disabled={authBusy}>Change email or request another code</button>
+            <button className="auth-submit" type="submit" disabled={authBusy || authCode.length !== 6}>{authBusy ? 'Verifying…' : authStep === 'signup-code' ? 'Verify email and create account' : 'Verify and sign in'}</button>
+            <button type="button" className="auth-back" onClick={() => { setAuthStep('credentials'); setAuthMessage('') }} disabled={authBusy}>Back to email and password</button>
           </form>}
-          <div className="auth-privacy"><ShieldCheck size={14} /> Email codes expire after 10 minutes and can only be used once.</div>
+          <div className="auth-privacy"><ShieldCheck size={14} /> Passwords are stored as Argon2id hashes, never as plain text. Codes expire after 10 minutes and are limited to five attempts.</div>
           {authMessage && <p className="auth-message" role="status">{authMessage}</p>}
+        </section>
+      </div>}
+      {showAccountSettings && <div className="auth-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowAccountSettings(false) }}>
+        <section className="auth-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="account-title">
+          <button className="auth-close" aria-label="Close account settings" onClick={() => setShowAccountSettings(false)}><X size={17} /></button>
+          <span className="auth-eyebrow">SETTINGS / ACCOUNT</span>
+          <h2 id="account-title">Account security</h2>
+          {accountInfo ? <>
+            <div className="account-identity"><span>{accountInfo.provider === 'email' ? 'EMAIL ACCOUNT' : `${accountInfo.provider?.toUpperCase() ?? 'ACCOUNT'} SIGN-IN`}</span><b>{accountInfo.email ?? githubLogin ?? 'Signed-in account'}</b></div>
+            {accountInfo.provider === 'email' ? <>
+              <form className="account-security-form" onSubmit={(event) => void handleToggleTwoFactor(event)}>
+              <div className="account-2fa-state"><span><b>Email two-step verification</b><small>{accountInfo.two_factor_enabled ? 'A code is required each time you sign in.' : 'Password only at sign-in.'}</small></span><span className={`account-state-pill ${accountInfo.two_factor_enabled ? 'enabled' : ''}`}>{accountInfo.two_factor_enabled ? 'ON' : 'OFF'}</span></div>
+              {!accountInfo.two_factor_available && <p>Configure Gmail SMTP before turning this on, so sign-in codes can be delivered.</p>}
+              {!twoFactorEnrollment && <><label htmlFor="account-password">Confirm your password to change this setting</label>
+              <input id="account-password" type="password" autoComplete="current-password" minLength={1} maxLength={128} value={accountPassword} onChange={(event) => setAccountPassword(event.target.value)} placeholder="Current password" disabled={accountBusy} />
+              <button className="auth-submit" type="submit" disabled={accountBusy || !accountPassword || (!accountInfo.two_factor_enabled && !accountInfo.two_factor_available)}>{accountBusy ? 'Saving…' : accountInfo.two_factor_enabled ? 'Disable two-step verification' : 'Enable two-step verification'}</button></>}
+              </form>
+              {twoFactorEnrollment && <form className="account-security-form" onSubmit={(event) => void handleConfirmTwoFactorEnrollment(event)}>
+                <label htmlFor="account-two-factor-code">Enter the six-digit setup code emailed to you</label>
+                <input id="account-two-factor-code" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} required value={twoFactorCode} onChange={(event) => setTwoFactorCode(event.target.value.replace(/\D/g, '').slice(0, 6))} placeholder="000000" disabled={accountBusy} />
+                <button className="auth-submit" type="submit" disabled={accountBusy || twoFactorCode.length !== 6}>{accountBusy ? 'Verifying…' : 'Verify and enable'}</button>
+              </form>}
+            </> : <p>Two-step verification for this account is managed by {accountInfo.provider === 'google' ? 'Google' : 'GitHub'}.</p>}
+          </> : <p>{accountMessage || 'Loading account settings…'}</p>}
+          {accountMessage && accountInfo && <p className="auth-message" role="status">{accountMessage}</p>}
+          <button className="auth-signout" onClick={() => void handleLogout()}>Sign out</button>
         </section>
       </div>}
     </main>

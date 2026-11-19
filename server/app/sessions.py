@@ -23,12 +23,14 @@ def create_session(
     user_id: str | None = None,
     login: str | None = None,
     workspace_id: str | None = None,
+    auth_provider: str | None = None,
 ) -> tuple[str, str]:
     workspace_id = workspace_id or secrets.token_urlsafe(24)
     claims = {
         "workspace_id": workspace_id,
         "user_id": user_id,
         "login": login,
+        "auth_provider": auth_provider,
         "expires_at": int(time.time()) + SESSION_MAX_AGE,
     }
     payload = quote(json.dumps(claims, separators=(",", ":")), safe="~")

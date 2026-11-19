@@ -7,12 +7,27 @@ class AnalyzeRequest(BaseModel):
     repository_url: HttpUrl
 
 
-class EmailCodeRequest(BaseModel):
+class EmailSignupRequest(BaseModel):
     email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=12, max_length=128)
 
 
 class EmailCodeVerifyRequest(BaseModel):
     email: str = Field(min_length=3, max_length=254)
+    code: str = Field(pattern=r"^\d{6}$")
+
+
+class EmailPasswordLoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class TwoFactorUpdateRequest(BaseModel):
+    enabled: bool
+    password: str = Field(min_length=1, max_length=128)
+
+
+class TwoFactorEnrollmentVerifyRequest(BaseModel):
     code: str = Field(pattern=r"^\d{6}$")
 
 

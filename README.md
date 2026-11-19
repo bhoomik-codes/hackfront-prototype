@@ -12,7 +12,7 @@ Repository intelligence that connects source code to the decisions and history b
 
 **Phase 4 — Temporary browser workspace.** Anonymous repository graphs are available only while the browser workspace is active. The app requests cleanup on exit, deletes the current index when leaving it, and expires inactive graphs after two hours. A periodic Aura cleanup removes expired and legacy anonymous graph data.
 
-**Phase 4.2 — Sign-in and opt-in saved indexes.** Users can authenticate with GitHub, Google, or an email one-time code. Google and email identities use the normalized, verified email address to retain the same account ID; existing GitHub account IDs remain compatible. Email codes are hashed in process memory, expire after 10 minutes, allow five verification attempts, and are rate-limited. SMTP credentials never reach the browser. Saved graph roots are associated with the authenticated account; indexes remain temporary unless a user signs in and presses **Save index**. OAuth access tokens are discarded after profile lookup and are not stored.
+**Phase 4.3 — Sign-in and opt-in saved indexes.** Users can authenticate with GitHub, Google, or an email/password account. Email signup requires a one-time email verification code; users can optionally enable email-code verification at each password sign-in from **Account settings**. Passwords are Argon2id hashes, verification codes are HMAC digests, and account records live in Neo4j without storing plaintext passwords. Google and email use separate account IDs so Google sign-in cannot bypass an email account's optional verification step; existing GitHub account IDs remain compatible. Codes expire after 10 minutes, allow five verification attempts, and are rate-limited. SMTP credentials never reach the browser. Saved graph roots are associated with the authenticated account; indexes remain temporary unless a user signs in and presses **Save index**. OAuth access tokens are discarded after profile lookup and are not stored.
 
 **Phase 5 — Conservative supersession links.** A later pull request or its discussion creates a `SUPERSEDES` relationship only when its text explicitly uses replacement/deprecation/revert language near a reference to an older pull request in the indexed window. The workspace highlights both ends of that link. No link is treated as proof that an older decision remains current.
 
@@ -29,7 +29,7 @@ npm run dev
 
 Open the local URL printed by Vite and choose **Explore sample** to inspect the workspace.
 
-To enable persistent saves locally, create a GitHub OAuth App with callback URL `http://127.0.0.1:8765/api/auth/github/callback`, then set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` in `server/.env`. For Google, create a web OAuth client with callback URL `http://127.0.0.1:8765/api/auth/google/callback` and set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. To enable email sign-in, set `SMTP_USERNAME` and `SMTP_PASSWORD` to a Gmail account and Google App Password; `SMTP_FROM` may be left blank to use the username. Do not put credentials in `VITE_*` variables or frontend code. Set `FRONTEND_URL` to your local Vite origin. Each sign-in method is optional; saved indexes require an authenticated account and an explicit save action.
+To enable persistent saves locally, create a GitHub OAuth App with callback URL `http://127.0.0.1:8765/api/auth/github/callback`, then set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` in `server/.env`. For Google, create a web OAuth client with callback URL `http://127.0.0.1:8765/api/auth/google/callback` and set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. To enable email signup and code delivery, set `SMTP_USERNAME` and `SMTP_PASSWORD` to a Gmail account and Google App Password; `SMTP_FROM` may be left blank to use the username. Do not put credentials in `VITE_*` variables or frontend code. Set `FRONTEND_URL` to your local Vite origin. Each sign-in method is optional; saved indexes require an authenticated account and an explicit save action.
 
 For a live analysis, paste a public GitHub repository URL and confirm the data handling notice. The app reads the default-branch tree, a bounded recent history window, and a small source subset for import mapping. It stores file paths and relationships, commit/PR/issue metadata and discussion records in your configured Neo4j database. Source file contents are fetched from GitHub on demand for in-app preview and are not persisted in Neo4j. The web service does not run repository code.
 
@@ -55,12 +55,12 @@ The production provider callbacks must be `https://<your-render-host>/api/auth/g
 - The web edition starts with public GitHub repositories; local folder import belongs to the later desktop edition.
 - Repository code is never executed during indexing.
 - Cloud graph storage and AI providers must be disclosed and opt-in.
-- Each browser receives a signed, HTTP-only workspace session. Temporary graphs are isolated to that workspace; saved graphs are accessible only to the verified GitHub account that owns them.
-- Repository indexes stay temporary unless the signed-in GitHub account owner explicitly saves them. Saved data is scoped to the immutable GitHub user ID and can be deleted from the workspace.
+- Each browser receives a signed, HTTP-only workspace session. Temporary graphs are isolated to that workspace; saved graphs are accessible only to the authenticated account that owns them.
+- Repository indexes stay temporary unless a signed-in user explicitly saves them. Saved data is scoped to an immutable provider identity or keyed email identity and can be deleted from the workspace.
 - Model API keys are held in page memory only. The user must opt in before repository evidence is sent to a model provider.
 - Graph and assistant coverage is bounded and cannot guarantee a complete history or a correct interpretation of intent. Inspect linked source records before relying on conclusions.
 - Supersession detection is deliberately limited to explicit wording and pull request references; it is not a semantic decision classifier. Absence of a detected link is inconclusive.
-- Persistent retention is tied to a verified GitHub account and requires the separate explicit save action.
+- Persistent retention is tied to a verified account and requires the separate explicit save action.
 
 ## Indexing limits
 

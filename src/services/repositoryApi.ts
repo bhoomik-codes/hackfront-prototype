@@ -42,6 +42,7 @@ export type AuthAvailability = {
   github_oauth_configured?: boolean
   google_oauth_configured?: boolean
   email_auth_configured?: boolean
+  auth_provider?: 'github' | 'google' | 'email' | null
 }
 
 export const startBrowserSession = () => request<AuthAvailability>('/api/session')
@@ -51,11 +52,25 @@ const redirectToProvider = (provider: 'github' | 'google') => {
 }
 export const loginWithGitHub = () => redirectToProvider('github')
 export const loginWithGoogle = () => redirectToProvider('google')
-export const requestEmailCode = (email: string) => request<{ message: string }>('/api/auth/email/request', {
-  method: 'POST', body: JSON.stringify({ email }),
+export const registerEmailAccount = (email: string, password: string) => request<{ message: string }>('/api/auth/email/register', {
+  method: 'POST', body: JSON.stringify({ email, password }),
 })
-export const verifyEmailCode = (email: string, code: string) => request<{ authenticated: boolean; login: string }>('/api/auth/email/verify', {
+export const verifyEmailSignup = (email: string, code: string) => request<{ authenticated: boolean; login: string }>('/api/auth/email/verify', {
   method: 'POST', body: JSON.stringify({ email, code }),
+})
+export const loginWithEmail = (email: string, password: string) => request<{ authenticated: boolean; requires_2fa: boolean; login: string }>('/api/auth/email/login', {
+  method: 'POST', body: JSON.stringify({ email, password }),
+})
+export const verifyEmailTwoFactor = (email: string, code: string) => request<{ authenticated: boolean; login: string }>('/api/auth/email/2fa/verify', {
+  method: 'POST', body: JSON.stringify({ email, code }),
+})
+export type AccountSettings = { email: string | null; provider: string | null; two_factor_enabled: boolean; two_factor_available: boolean }
+export const getAccountSettings = () => request<AccountSettings>('/api/account')
+export const updateTwoFactor = (enabled: boolean, password: string) => request<{ two_factor_enabled: boolean; enrollment_required?: boolean }>('/api/account/two-factor', {
+  method: 'POST', body: JSON.stringify({ enabled, password }),
+})
+export const confirmTwoFactorEnrollment = (code: string) => request<{ two_factor_enabled: boolean }>('/api/account/two-factor/confirm', {
+  method: 'POST', body: JSON.stringify({ code }),
 })
 export const logout = () => request<void>('/api/auth/logout', { method: 'POST' })
 export const checkApiHealth = () => request<ApiHealth>('/api/health')
