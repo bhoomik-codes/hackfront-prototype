@@ -1,4 +1,5 @@
 import hashlib
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -21,6 +22,29 @@ SCHEMA = (
     "CREATE INDEX comment_repository IF NOT EXISTS FOR (n:Comment) ON (n.repository_id)",
     "CREATE INDEX person_repository IF NOT EXISTS FOR (n:Person) ON (n.repository_id)",
 )
+
+_OVERRIDE_TERMS = r"supersed\w*|replac\w*|deprecat\w*|revert\w*|no longer"
+_OVERRIDE_BEFORE_REFERENCE = re.compile(
+    rf"\b(?:{_OVERRIDE_TERMS})\b[^#\n]{{0,100}}#(\d+)", re.IGNORECASE
+)
+_REFERENCE_BEFORE_OVERRIDE = re.compile(
+    rf"#(\d+)[^\n]{{0,100}}\b(?:{_OVERRIDE_TERMS})\b", re.IGNORECASE
+)
+
+
+def _explicitly_superseded_prs(*texts: object) -> set[int]:
+    """Find only nearby, explicit override phrases that name a PR number."""
+    targets: set[int] = set()
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        bounded = text[:8_000]
+        matches = [
+            *_OVERRIDE_BEFORE_REFERENCE.findall(bounded),
+            *_REFERENCE_BEFORE_OVERRIDE.findall(bounded),
+        ]
+        targets.update(int(number) for number in matches if number.isdigit())
+    return targets
 
 
 def _short(value: object, limit: int = 12_000) -> str:
@@ -291,6 +315,29 @@ async def index_repository(
                     }
                 )
 
+    pull_numbers = {
+        int(row["number"]): str(row["id"])
+        for row in pull_rows
+        if isinstance(row.get("number"), int)
+    }
+    supersedes_edges: list[dict[str, str]] = []
+    for pull in pull_rows:
+        number = pull.get("number")
+        if not isinstance(number, int):
+            continue
+        for target_number in _explicitly_superseded_prs(
+            pull.get("title"), pull.get("body")
+        ):
+            target = pull_numbers.get(target_number)
+            if target and target_number < number:
+                supersedes_edges.append(
+                    {
+                        "repository_id": repository_id,
+                        "source": str(pull["id"]),
+                        "target": target,
+                    }
+                )
+
     issue_rows: list[dict[str, Any]] = []
     issue_edges: list[dict[str, str]] = []
     for issue in issues if isinstance(issues, list) else []:
@@ -370,6 +417,16 @@ async def index_repository(
                 "target": identity,
             }
         )
+        for target_number in _explicitly_superseded_prs(body):
+            target = pull_numbers.get(target_number)
+            if target and target_number < number:
+                supersedes_edges.append(
+                    {
+                        "repository_id": repository_id,
+                        "source": identity,
+                        "target": target,
+                    }
+                )
         if user_id:
             author_edges.append(
                 {"repository_id": repository_id, "source": user_id, "target": identity}
@@ -419,6 +476,7 @@ async def index_repository(
             ("MODIFIES", pull_edges),
             ("REFERENCES", issue_edges),
             ("HAS_COMMENT", comment_edges),
+            ("SUPERSEDES", supersedes_edges),
         ):
             await _upsert_edges(transaction, relationship, rows)
 
@@ -433,6 +491,7 @@ async def index_repository(
         "pull_requests": len(pull_rows),
         "issues": len(issue_rows),
         "discussion_records": len(comment_rows),
+        "explicit_supersession_links": len(supersedes_edges),
     }
 
 
@@ -578,6 +637,9 @@ async def read_repository_graph(
     for item in coverage_records:
         for label in item["labels"]:
             coverage[label.lower()] = int(item["amount"])
+    coverage["explicit_supersession_links"] = sum(
+        1 for edge in edges if edge["kind"] == "SUPERSEDES"
+    )
     return {
         "repository": repo_meta,
         "nodes": nodes,

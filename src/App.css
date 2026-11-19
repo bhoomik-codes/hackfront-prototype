@@ -175,6 +175,11 @@ a { color: inherit; text-decoration: none; }
 .entity-meta { display: flex; justify-content: space-between; align-items: baseline; padding: 11px 1px 0; margin-top: 9px; border-top: 1px solid #282d26; }
 .entity-meta span { color: #737a6e; font: 8px var(--mono); letter-spacing: .06em; }
 .entity-meta b { color: #b7beb0; font-size: 9px; font-weight: 500; }
+.superseded-notice { display: grid; gap: 6px; padding: 10px; margin-top: 12px; border: 1px solid #596744; border-radius: 4px; background: #20271a; }
+.superseded-notice > b { color: #d2f06c; font: 7px var(--mono); letter-spacing: .08em; }
+.superseded-notice > span { color: #aab39d; font-size: 8px; line-height: 1.5; }
+.superseded-notice button { display: flex; align-items: center; justify-content: space-between; padding: 6px 7px; border: 1px solid #3f4b31; border-radius: 3px; color: #e0e7d1; background: #272f20; font-size: 8px; }
+.superseded-notice button:hover { border-color: #91a866; }
 .code-card { margin-top: 18px; border: 1px solid #2f352b; border-radius: 4px; overflow: hidden; background: #11140f; }
 .code-card-head, .code-card-foot { display: flex; align-items: center; justify-content: space-between; height: 31px; padding: 0 9px; background: #1a1e17; }
 .code-card-head { border-bottom: 1px solid #2d3329; }

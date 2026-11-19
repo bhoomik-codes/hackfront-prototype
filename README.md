@@ -12,6 +12,8 @@ Repository intelligence that connects source code to the decisions and history b
 
 **Phase 4 — Persistent browser workspace.** Indexed repositories can be reopened after a refresh from a list scoped to the signed browser workspace. Users can remove a repository graph from Aura from the workspace.
 
+**Phase 5 — Conservative supersession links.** A later pull request or its discussion creates a `SUPERSEDES` relationship only when its text explicitly uses replacement/deprecation/revert language near a reference to an older pull request in the indexed window. The workspace highlights both ends of that link. No link is treated as proof that an older decision remains current.
+
 ## Run locally
 
 Requirements: Node.js 20.19+ or 22.12+.
@@ -46,6 +48,7 @@ npm audit
 - Each browser receives an anonymous, signed, HTTP-only workspace session; repository graph reads and deletion are scoped to that session.
 - Model API keys are held in page memory only. The user must opt in before repository evidence is sent to a model provider.
 - Graph and assistant coverage is bounded and cannot guarantee a complete history or a correct interpretation of intent. Inspect linked source records before relying on conclusions.
+- Supersession detection is deliberately limited to explicit wording and pull request references; it is not a semantic decision classifier. Absence of a detected link is inconclusive.
 
 ## Indexing limits
 

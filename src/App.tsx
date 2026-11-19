@@ -100,7 +100,7 @@ function makeElements(mode: GraphMode, search: string, graphData: RepositoryGrap
     ...(typeof node.x === 'number' && typeof node.y === 'number' ? { position: { x: node.x, y: node.y } } : {}),
   }))
   const edges = graphData
-    ? graphData.edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target)).map((edge) => ({ data: { id: edge.id, source: edge.source, target: edge.target, label: edge.label } }))
+    ? graphData.edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target)).map((edge) => ({ data: { id: edge.id, source: edge.source, target: edge.target, kind: edge.kind, label: edge.kind === 'SUPERSEDES' ? 'explicitly supersedes' : edge.label } }))
     : graphEdges[mode].filter(([from, to]) => visibleIds.has(from) && visibleIds.has(to)).map(([source, target, label], index) => ({ data: { id: `${source}-${target}-${index}`, source, target, label } }))
   return [
     ...colors,
@@ -138,6 +138,7 @@ function GraphCanvas({ mode, query, graphData, onSelect, selectedId }: { mode: G
           { selector: 'node[kind = "issue"]', style: { shape: 'round-tag' } },
           { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#d2f06c', 'width': 34, 'height': 34, 'z-index': 999 } },
           { selector: 'edge', style: { 'curve-style': 'bezier', 'line-color': '#40473d', 'target-arrow-color': '#737d6b', 'target-arrow-shape': 'triangle', 'arrow-scale': 0.72, 'width': 1.2, 'label': 'data(label)', 'font-size': '8px', 'color': '#9ca496', 'text-background-color': '#111410', 'text-background-opacity': 0.92, 'text-background-padding': '3px', 'text-rotation': 'autorotate', 'opacity': 0.85 } },
+          { selector: 'edge[kind = "SUPERSEDES"]', style: { 'line-color': '#d2f06c', 'target-arrow-color': '#d2f06c', width: 2, color: '#d2f06c', 'font-weight': 700, opacity: 1 } },
           { selector: 'edge:selected', style: { 'line-color': '#d2f06c', 'target-arrow-color': '#d2f06c', width: 2 } },
         ],
       })
@@ -201,6 +202,16 @@ function App() {
       .map((edge) => nodes.find((node) => node.id === (edge.source === selected.id ? edge.target : edge.source)))
       .filter((node): node is GraphNode => Boolean(node))
       .filter((node, index, list) => list.findIndex((candidate) => candidate.id === node.id) === index)
+    : []
+  const supersededBy = activeRepository && liveGraph && selected
+    ? liveGraph.edges.filter((edge) => edge.kind === 'SUPERSEDES' && edge.target === selected.id)
+      .map((edge) => nodes.find((node) => node.id === edge.source))
+      .filter((node): node is GraphNode => Boolean(node))
+    : []
+  const supersedes = activeRepository && liveGraph && selected
+    ? liveGraph.edges.filter((edge) => edge.kind === 'SUPERSEDES' && edge.source === selected.id)
+      .map((edge) => nodes.find((node) => node.id === edge.target))
+      .filter((node): node is GraphNode => Boolean(node))
     : []
   const selectNode = useMemo(() => (id: string) => {
     setSelectedId(id)
@@ -490,13 +501,14 @@ function App() {
               <div className="entity-type"><span className={`entity-mark ${selected?.kind ?? 'file'}`}>{selected?.kind === 'symbol' ? <Code size={15} /> : selected?.kind === 'commit' ? <GitCommit size={15} /> : selected?.kind === 'pr' ? <GitPullRequest size={15} /> : selected?.kind === 'issue' ? <BookOpenText size={15} /> : <FileCode size={15} />}</span><span>{selected?.kind?.toUpperCase() ?? 'FILE'}</span><span className="verified-preview"><span /> PREVIEW</span></div>
               <h3>{selected?.label ?? 'Select a graph node'}</h3>
               <p className="entity-description">{selected?.description}</p>
+              {(supersededBy.length > 0 || supersedes.length > 0) && <div className="superseded-notice"><b>EXPLICIT HISTORY LINK</b>{supersededBy.length > 0 && <><span>This record is explicitly superseded by:</span>{supersededBy.map((node) => <button key={`newer-${node.id}`} onClick={() => setSelectedId(node.id)}>{node.label}<ArrowRight size={12} /></button>)}</>}{supersedes.length > 0 && <><span>This record explicitly supersedes:</span>{supersedes.map((node) => <button key={`older-${node.id}`} onClick={() => setSelectedId(node.id)}>{node.label}<ArrowRight size={12} /></button>)}</>}</div>}
               {selected?.path && <button className="path-link" onClick={() => openGitHub(selected.path ?? undefined)}><Code size={14} /><span>{selected.path}</span><ArrowRight size={13} /></button>}
               {selected?.date && <div className="entity-meta"><span>DATE</span><b>{selected.date}</b></div>}
               {selected?.author && <div className="entity-meta"><span>{selected.kind === 'person' ? 'IDENTITY' : 'AUTHOR'}</span><b>{selected.author}</b></div>}
               <div className="code-card"><div className="code-card-head"><span><FileCode size={13} /> {previewName}</span><button disabled={!previewPath} onClick={() => openGitHub(previewPath)}>OPEN FILE <ArrowRight size={12} /></button></div><div className="code-content">{sourceLines.length ? sourceLines.map(([line, code, kind]) => <div className="code-line" key={line}><span className="line-number">{line}</span><code className={kind}>{code || ' '}</code></div>) : <div className="source-state">{sourceError || (graphLoading ? 'Loading the selected file…' : previewPath ? 'Loading source from GitHub…' : 'Select a file node to preview its contents.')}</div>}</div><div className="code-card-foot"><span>{sourceLines.length ? `${sourceLines.length} LINES SHOWN${currentSource?.truncated ? ' · FILE TRUNCATED' : ''}` : 'SOURCE PREVIEW'}</span><button disabled={!previewPath} onClick={() => openGitHub(previewPath)}>VIEW ON GITHUB <ArrowRight size={12} /></button></div></div>
               <div className="evidence-preview"><div className="evidence-head"><span><span className="evidence-mark"><GitCommit size={13} /></span> {activeRepository ? 'CONNECTED GRAPH NODES' : 'HISTORY CONNECTIONS'}</span><span>{activeRepository ? connectedNodes.length : 2}</span></div>{activeRepository ? connectedNodes.length ? connectedNodes.slice(0, 8).map((node) => <button key={node.id} onClick={() => setSelectedId(node.id)}><span className="evidence-type">{node.kind.toUpperCase()}</span><span className="evidence-title">{node.label}</span><span className="evidence-sub">{node.date ?? node.description ?? 'Connected in the indexed graph'}</span><ArrowRight size={14} /></button>) : <p className="source-state">No connected records are present in this graph view.</p> : <><button onClick={() => switchGraphMode('decisions')}><span className="evidence-type">COMMIT</span><span className="evidence-title">Introduce shared defaults</span><span className="evidence-sub">Illustrative sample</span><ArrowRight size={14} /></button><button onClick={() => switchGraphMode('decisions')}><span className="evidence-type issue-type">ISSUE</span><span className="evidence-title">Inconsistent config behavior</span><span className="evidence-sub">Illustrative sample</span><ArrowRight size={14} /></button></>}</div>
               <button className="ask-why-button" onClick={() => setActiveSource('assistant')}><Sparkle size={15} /> Ask why this exists <ArrowRight size={14} /></button>
-              <div className="provenance-note"><ShieldCheck size={14} /><span>{activeRepository ? 'Connections are extracted from the indexed repository tree and available GitHub history. No decision is inferred as fact yet.' : 'Sample content is illustrative. Linked sources are not asserted as factual history.'}</span></div>
+              <div className="provenance-note"><ShieldCheck size={14} /><span>{activeRepository ? 'Supersession links appear only when later pull request text explicitly names an older pull request as replaced. Missing links do not prove a decision is current.' : 'Sample content is illustrative. Linked sources are not asserted as factual history.'}</span></div>
             </div>}
           </aside>
         </div>
