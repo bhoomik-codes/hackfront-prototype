@@ -1,10 +1,16 @@
 import asyncio
+import hashlib
+import hmac
 import logging
+import re
 import secrets
+import smtplib
+import ssl
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -34,12 +40,15 @@ from .graph import (
 from .schemas import (
     AnalyzeAccepted,
     AnalyzeRequest,
+    EmailCodeRequest,
+    EmailCodeVerifyRequest,
     JobState,
     RepositoryFile,
     RepositoryGraph,
     RepositorySummary,
 )
 from .sessions import (
+    GOOGLE_OAUTH_STATE_COOKIE,
     OAUTH_STATE_COOKIE,
     SESSION_COOKIE,
     SESSION_MAX_AGE,
@@ -55,7 +64,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("why.api")
 settings = get_settings()
-if (settings.neo4j_configured or settings.github_oauth_configured) and (
+if (
+    settings.neo4j_configured
+    or settings.github_oauth_configured
+    or settings.google_oauth_configured
+    or settings.email_auth_configured
+) and (
     len(settings.session_secret) < 32
     or "replace-with" in settings.session_secret.lower()
     or "change-me" in settings.session_secret.lower()
@@ -90,6 +104,9 @@ async def lifespan(app: FastAPI):
     app.state.jobs: dict[str, dict[str, object]] = {}
     app.state.import_limits: defaultdict[str, deque[float]] = defaultdict(deque)
     app.state.request_limits: defaultdict[str, deque[float]] = defaultdict(deque)
+    app.state.auth_request_limits: dict[str, deque[float]] = {}
+    app.state.email_challenges: dict[str, dict[str, object]] = {}
+    app.state.email_send_times: dict[str, float] = {}
     app.state.active_jobs = set()
     app.state.workspace_locks = {}
     app.state.closed_workspaces = {}
@@ -170,6 +187,8 @@ async def secure_api_response(request: Request, call_next):
             "/api/health",
             "/api/auth/github",
             "/api/auth/github/callback",
+            "/api/auth/google",
+            "/api/auth/google/callback",
         }:
             response = await call_next(request)
         else:
@@ -271,6 +290,71 @@ def _driver(request: Request):
             },
         )
     return driver
+
+
+EMAIL_PATTERN = re.compile(
+    r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$",
+    re.IGNORECASE,
+)
+
+
+def _normalise_email(value: str) -> str:
+    email = value.strip().casefold()
+    if len(email) > 254 or not EMAIL_PATTERN.fullmatch(email):
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_email", "message": "Enter a valid email address."},
+        )
+    return email
+
+
+def _allow_auth_request(request: Request, key: str, limit: int) -> None:
+    now = time.monotonic()
+    table = request.app.state.auth_request_limits
+    events = table.setdefault(key, deque())
+    while events and now - events[0] > 3600:
+        events.popleft()
+    if len(events) >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "email_auth_rate_limited",
+                "message": "Too many sign-in code requests. Try again later.",
+            },
+        )
+    events.append(now)
+    if len(table) > 4096:
+        for old_key, values in list(table.items()):
+            while values and now - values[0] > 3600:
+                values.popleft()
+            if not values:
+                table.pop(old_key, None)
+        while len(table) > 4096:
+            table.pop(next(iter(table)))
+
+
+def _email_user_id(email: str) -> str:
+    digest = hmac.new(
+        session_secret.encode("utf-8"), email.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return f"email:{digest}"
+
+
+def _send_email_code(email: str, code: str) -> None:
+    message = EmailMessage()
+    message["Subject"] = "Your Why sign-in code"
+    message["From"] = settings.smtp_from.strip() or settings.smtp_username.strip()
+    message["To"] = email
+    message.set_content(
+        f"Your Why verification code is {code}. It expires in 10 minutes. "
+        "If you did not request this code, you can ignore this email."
+    )
+    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as server:
+        server.ehlo()
+        server.starttls(context=ssl.create_default_context())
+        server.ehlo()
+        server.login(settings.smtp_username, settings.smtp_password)
+        server.send_message(message)
 
 
 def _update_job(request: Request, job_id: str, **changes: object) -> None:
@@ -433,6 +517,9 @@ async def browser_session(request: Request) -> dict[str, object]:
                 "authenticated": False,
                 "login": None,
                 "oauth_configured": settings.github_oauth_configured,
+                "github_oauth_configured": settings.github_oauth_configured,
+                "google_oauth_configured": settings.google_oauth_configured,
+                "email_auth_configured": settings.email_auth_configured,
             }
         )
         _set_session_cookie(response, token)
@@ -442,7 +529,124 @@ async def browser_session(request: Request) -> dict[str, object]:
         "authenticated": bool(claims.get("user_id")),
         "login": claims.get("login"),
         "oauth_configured": settings.github_oauth_configured,
+        "github_oauth_configured": settings.github_oauth_configured,
+        "google_oauth_configured": settings.google_oauth_configured,
+        "email_auth_configured": settings.email_auth_configured,
     }
+
+
+@app.post("/api/auth/email/request")
+async def request_email_code(
+    body: EmailCodeRequest, request: Request
+) -> dict[str, str]:
+    if not settings.email_auth_configured:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "email_auth_not_configured",
+                "message": "Email sign-in is not configured yet. Add the SMTP settings and try again.",
+            },
+        )
+    email = _normalise_email(body.email)
+    workspace_id = _owner_key(request)
+    now = time.monotonic()
+    for old_workspace, old_challenge in list(
+        request.app.state.email_challenges.items()
+    ):
+        if float(old_challenge.get("expires_at", 0)) <= now:
+            request.app.state.email_challenges.pop(old_workspace, None)
+    for old_workspace, sent_at in list(request.app.state.email_send_times.items()):
+        if now - sent_at > 3600:
+            request.app.state.email_send_times.pop(old_workspace, None)
+    if now - request.app.state.email_send_times.get(workspace_id, 0) < 60:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "email_code_cooldown",
+                "message": "Wait a minute before requesting another sign-in code.",
+            },
+        )
+    email_key = hmac.new(
+        session_secret.encode("utf-8"), email.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    client_ip = request.client.host if request.client else "unknown-client"
+    _allow_auth_request(request, f"email:{email_key}", 5)
+    _allow_auth_request(request, f"ip:{client_ip}", 10)
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    try:
+        await asyncio.to_thread(_send_email_code, email, code)
+    except Exception as error:
+        logger.warning("Email verification delivery failed (%s)", type(error).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "email_delivery_failed",
+                "message": "The sign-in email could not be sent. Check the SMTP settings and try again later.",
+            },
+        ) from error
+    code_digest = hmac.new(
+        session_secret.encode("utf-8"),
+        f"{workspace_id}:{email}:{code}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    request.app.state.email_challenges[workspace_id] = {
+        "email": email,
+        "digest": code_digest,
+        "expires_at": now + 600,
+        "attempts": 0,
+    }
+    request.app.state.email_send_times[workspace_id] = now
+    return {"message": "If the address can receive mail, a sign-in code is on its way."}
+
+
+@app.post("/api/auth/email/verify")
+async def verify_email_code(body: EmailCodeVerifyRequest, request: Request) -> Response:
+    email = _normalise_email(body.email)
+    workspace_id = _owner_key(request)
+    challenge = request.app.state.email_challenges.get(workspace_id)
+    now = time.monotonic()
+    if (
+        not challenge
+        or challenge.get("email") != email
+        or float(challenge.get("expires_at", 0)) <= now
+    ):
+        request.app.state.email_challenges.pop(workspace_id, None)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "email_code_expired",
+                "message": "That code is missing or expired. Request a new code.",
+            },
+        )
+    attempts = int(challenge.get("attempts", 0)) + 1
+    challenge["attempts"] = attempts
+    expected = str(challenge.get("digest", ""))
+    supplied = hmac.new(
+        session_secret.encode("utf-8"),
+        f"{workspace_id}:{email}:{body.code}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, supplied):
+        if attempts >= 5:
+            request.app.state.email_challenges.pop(workspace_id, None)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "email_code_invalid",
+                "message": "That code is incorrect. Check the email and try again.",
+            },
+        )
+    request.app.state.email_challenges.pop(workspace_id, None)
+    claims = session_claims(request.cookies.get(SESSION_COOKIE), session_secret) or {}
+    existing_workspace = str(claims.get("workspace_id", workspace_id))
+    if _workspace_closed(request, existing_workspace):
+        existing_workspace = None
+    _new_workspace_id, token = create_session(
+        session_secret, _email_user_id(email), email, existing_workspace
+    )
+    response = JSONResponse({"authenticated": True, "login": email})
+    _set_session_cookie(response, token)
+    return response
 
 
 @app.get("/api/auth/github")
@@ -549,6 +753,117 @@ async def finish_github_login(request: Request, code: str = "", state: str = "")
     )
     _set_session_cookie(response, session_token)
     response.delete_cookie(OAUTH_STATE_COOKIE, path="/api/auth/github/callback")
+    return response
+
+
+@app.get("/api/auth/google")
+async def begin_google_login():
+    if not settings.google_oauth_configured:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "google_oauth_not_configured",
+                "message": "Google sign-in is not configured on this API yet.",
+            },
+        )
+    state, state_cookie = create_oauth_state(session_secret)
+    response = RedirectResponse(
+        "https://accounts.google.com/o/oauth2/v2/auth?"
+        + urlencode(
+            {
+                "client_id": settings.google_client_id,
+                "redirect_uri": settings.google_oauth_callback_url,
+                "response_type": "code",
+                "scope": "openid email profile",
+                "state": state,
+                "prompt": "select_account",
+            }
+        ),
+        status_code=302,
+    )
+    response.set_cookie(
+        GOOGLE_OAUTH_STATE_COOKIE,
+        state_cookie,
+        max_age=600,
+        httponly=True,
+        secure=settings.secure_session_cookie,
+        samesite="lax",
+        path="/api/auth/google/callback",
+    )
+    return response
+
+
+@app.get("/api/auth/google/callback")
+async def finish_google_login(request: Request, code: str = "", state: str = ""):
+    if not settings.google_oauth_configured:
+        return RedirectResponse(settings.frontend_url + "?auth=unavailable", 303)
+    state_cookie = request.cookies.get(GOOGLE_OAUTH_STATE_COOKIE)
+    if not verify_oauth_state(state_cookie, state, session_secret) or not code:
+        response = RedirectResponse(settings.frontend_url + "?auth=failed", 303)
+        response.delete_cookie(
+            GOOGLE_OAUTH_STATE_COOKIE, path="/api/auth/google/callback"
+        )
+        return response
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0), follow_redirects=False
+        ) as client:
+            token_response = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": settings.google_client_id,
+                    "client_secret": settings.google_client_secret,
+                    "code": code,
+                    "redirect_uri": settings.google_oauth_callback_url,
+                    "grant_type": "authorization_code",
+                },
+                headers={"Accept": "application/json"},
+            )
+            token_response.raise_for_status()
+            access_token = token_response.json().get("access_token")
+            if not isinstance(access_token, str) or not access_token:
+                raise ValueError("Google did not return an access token")
+            profile_response = await client.get(
+                "https://openidconnect.googleapis.com/v1/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            profile_response.raise_for_status()
+            profile = profile_response.json()
+        google_sub = profile.get("sub")
+        email = _normalise_email(str(profile.get("email", "")))
+        if (
+            not isinstance(google_sub, str)
+            or not google_sub
+            or profile.get("email_verified") is not True
+        ):
+            raise ValueError("Google did not return a verified email identity")
+        display_name = profile.get("name")
+        login = (
+            str(display_name)[:100]
+            if isinstance(display_name, str) and display_name.strip()
+            else email
+        )
+    except (httpx.HTTPError, ValueError, KeyError):
+        logger.warning("Google OAuth sign-in failed")
+        response = RedirectResponse(settings.frontend_url + "?auth=failed", 303)
+        response.delete_cookie(
+            GOOGLE_OAUTH_STATE_COOKIE, path="/api/auth/google/callback"
+        )
+        return response
+    finally:
+        access_token = None
+    existing_claims = session_claims(
+        request.cookies.get(SESSION_COOKIE), session_secret
+    )
+    workspace_id = str(existing_claims["workspace_id"]) if existing_claims else None
+    if workspace_id and _workspace_closed(request, workspace_id):
+        workspace_id = None
+    _workspace_id, session_token = create_session(
+        session_secret, _email_user_id(email), login, workspace_id
+    )
+    response = RedirectResponse(settings.frontend_url + "?auth=success", 303)
+    _set_session_cookie(response, session_token)
+    response.delete_cookie(GOOGLE_OAUTH_STATE_COOKIE, path="/api/auth/google/callback")
     return response
 
 

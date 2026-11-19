@@ -7,6 +7,15 @@ class AnalyzeRequest(BaseModel):
     repository_url: HttpUrl
 
 
+class EmailCodeRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+
+class EmailCodeVerifyRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    code: str = Field(pattern=r"^\d{6}$")
+
+
 class AnalyzeAccepted(BaseModel):
     job_id: str
     status: Literal["queued"]

@@ -34,11 +34,29 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T
 }
 
-export const startBrowserSession = () => request<{ ready: boolean; authenticated?: boolean; login?: string | null; oauth_configured?: boolean }>('/api/session')
-export const loginWithGitHub = () => {
-  try { sessionStorage.setItem('why-oauth-redirect', 'true') } catch { /* redirect still works when storage is disabled */ }
-  window.location.assign(`${API_BASE_URL}/api/auth/github`)
+export type AuthAvailability = {
+  ready: boolean
+  authenticated?: boolean
+  login?: string | null
+  oauth_configured?: boolean
+  github_oauth_configured?: boolean
+  google_oauth_configured?: boolean
+  email_auth_configured?: boolean
 }
+
+export const startBrowserSession = () => request<AuthAvailability>('/api/session')
+const redirectToProvider = (provider: 'github' | 'google') => {
+  try { sessionStorage.setItem('why-oauth-redirect', 'true') } catch { /* redirect still works when storage is disabled */ }
+  window.location.assign(`${API_BASE_URL}/api/auth/${provider}`)
+}
+export const loginWithGitHub = () => redirectToProvider('github')
+export const loginWithGoogle = () => redirectToProvider('google')
+export const requestEmailCode = (email: string) => request<{ message: string }>('/api/auth/email/request', {
+  method: 'POST', body: JSON.stringify({ email }),
+})
+export const verifyEmailCode = (email: string, code: string) => request<{ authenticated: boolean; login: string }>('/api/auth/email/verify', {
+  method: 'POST', body: JSON.stringify({ email, code }),
+})
 export const logout = () => request<void>('/api/auth/logout', { method: 'POST' })
 export const checkApiHealth = () => request<ApiHealth>('/api/health')
 

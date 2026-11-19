@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     github_client_id: str = ""
     github_client_secret: str = ""
     github_oauth_callback_url: str = "http://127.0.0.1:8765/api/auth/github/callback"
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_oauth_callback_url: str = "http://127.0.0.1:8765/api/auth/google/callback"
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
     frontend_url: str = "http://127.0.0.1:5173/"
     github_api_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
     max_indexed_files: int = Field(default=1800, ge=100, le=10_000)
@@ -43,6 +51,14 @@ class Settings(BaseSettings):
     @property
     def github_oauth_configured(self) -> bool:
         return bool(self.github_client_id and self.github_client_secret)
+
+    @property
+    def google_oauth_configured(self) -> bool:
+        return bool(self.google_client_id and self.google_client_secret)
+
+    @property
+    def email_auth_configured(self) -> bool:
+        return bool(self.smtp_host and self.smtp_username and self.smtp_password)
 
 
 @lru_cache

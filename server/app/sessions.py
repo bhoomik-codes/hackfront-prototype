@@ -9,6 +9,7 @@ from urllib.parse import quote, unquote
 SESSION_COOKIE = "why_workspace"
 SESSION_MAX_AGE = 60 * 60 * 24 * 14
 OAUTH_STATE_COOKIE = "why_oauth_state"
+GOOGLE_OAUTH_STATE_COOKIE = "why_google_oauth_state"
 
 
 def _signature(workspace_id: str, secret: str) -> str:

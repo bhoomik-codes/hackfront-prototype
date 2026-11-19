@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Core, ElementDefinition } from 'cytoscape'
 import type { GraphMode, RepositoryGraphData, RepositoryGraphNode, RepositorySource, RepositorySummary } from './types'
-import { checkApiHealth, deleteRepository, getAnalysisJob, getRepositories, getRepositoryFile, getRepositoryGraph, loginWithGitHub, logout, RepositoryApiError, saveRepository, startBrowserSession, startRepositoryAnalysis } from './services/repositoryApi'
+import { checkApiHealth, deleteRepository, getAnalysisJob, getRepositories, getRepositoryFile, getRepositoryGraph, loginWithGitHub, loginWithGoogle, logout, RepositoryApiError, requestEmailCode, saveRepository, startBrowserSession, startRepositoryAnalysis, verifyEmailCode } from './services/repositoryApi'
 import { askWithEvidence, type AssistantSettings, type EvidenceCitation } from './services/evidenceAssistant'
 import {
   ArrowDown, ArrowRight, ArrowsOut, BookOpenText,
   CheckCircle, CaretDown, ClockCounterClockwise, Code, FileCode, GearSix,
   FolderSimple, GithubLogo, GitCommit, GitPullRequest, Graph,
-  MagnifyingGlass, PaperPlaneRight, Plus, ShieldCheck, Sparkle, Trash, X,
+  GoogleLogo, MagnifyingGlass, PaperPlaneRight, Plus, ShieldCheck, Sparkle, Trash, X,
 } from '@phosphor-icons/react'
 import './App.css'
 
@@ -195,7 +195,15 @@ function App() {
   const [activeRepository, setActiveRepository] = useState<{ owner: string; repository: string; fullName: string; branch?: string } | null>(null)
   const [savedRepositories, setSavedRepositories] = useState<RepositorySummary[]>([])
   const [githubLogin, setGithubLogin] = useState<string | null>(null)
-  const [oauthConfigured, setOauthConfigured] = useState(false)
+  const [githubOAuthConfigured, setGithubOAuthConfigured] = useState(false)
+  const [googleOAuthConfigured, setGoogleOAuthConfigured] = useState(false)
+  const [emailAuthConfigured, setEmailAuthConfigured] = useState(false)
+  const [showAuth, setShowAuth] = useState(false)
+  const [authEmail, setAuthEmail] = useState('')
+  const [authCode, setAuthCode] = useState('')
+  const [authStep, setAuthStep] = useState<'email' | 'code'>('email')
+  const [authBusy, setAuthBusy] = useState(false)
+  const [authMessage, setAuthMessage] = useState('')
   const [activeIsSaved, setActiveIsSaved] = useState(false)
   const [liveGraph, setLiveGraph] = useState<RepositoryGraphData | null>(null)
   const [graphLoading, setGraphLoading] = useState(false)
@@ -243,7 +251,9 @@ function App() {
     void startBrowserSession().then(async (session) => {
       if (active) {
         setGithubLogin(session.authenticated ? session.login ?? 'GitHub user' : null)
-        setOauthConfigured(Boolean(session.oauth_configured))
+        setGithubOAuthConfigured(Boolean(session.github_oauth_configured ?? session.oauth_configured))
+        setGoogleOAuthConfigured(Boolean(session.google_oauth_configured))
+        setEmailAuthConfigured(Boolean(session.email_auth_configured))
       }
       const health = await checkApiHealth()
       if (active) setApiHealth({ ready: health.status === 'ready' && health.neo4j_configured, message: health.message ?? '' })
@@ -410,9 +420,43 @@ function App() {
     setWorkspace(true)
   }
 
+  const openAuthDialog = () => {
+    setAuthStep('email')
+    setAuthMessage('')
+    setShowAuth(true)
+  }
+
+  const handleRequestEmailCode = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setAuthBusy(true)
+    try {
+      await requestEmailCode(authEmail.trim())
+      setAuthStep('code')
+      setAuthCode('')
+      setAuthMessage('If the address can receive mail, a sign-in code is on its way.')
+    } catch (error) {
+      setAuthMessage(error instanceof Error ? error.message : 'The sign-in code could not be sent.')
+    } finally { setAuthBusy(false) }
+  }
+
+  const handleVerifyEmailCode = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setAuthBusy(true)
+    try {
+      const session = await verifyEmailCode(authEmail.trim(), authCode.trim())
+      setGithubLogin(session.login)
+      setShowAuth(false)
+      setNotice(`Signed in as ${session.login}. You can now choose which indexes to save.`)
+      setAuthMessage('')
+      void getRepositories().then(setSavedRepositories).catch(() => { /* sign-in remains available without saved-index refresh */ })
+    } catch (error) {
+      setAuthMessage(error instanceof Error ? error.message : 'That sign-in code could not be verified.')
+    } finally { setAuthBusy(false) }
+  }
+
   const handleSaveIndex = async () => {
     if (!activeRepository) return
-    if (!githubLogin) { loginWithGitHub(); return }
+    if (!githubLogin) { openAuthDialog(); return }
     try {
       await saveRepository(activeRepository.owner, activeRepository.repository)
       setActiveIsSaved(true)
@@ -510,7 +554,7 @@ function App() {
       {!workspace ? <section className="landing">
         <header className="landing-nav">
           <a className="brand" href="#top" aria-label="Why home"><span className="brand-mark"><Graph size={17} weight="bold" /></span><span>why<span className="brand-period">.</span></span></a>
-          <div className="nav-right"><span className="nav-status"><span className={`status-dot ${apiHealth?.ready ? '' : 'muted-dot'}`} /> {apiHealth?.ready ? 'Neo4j graph ready' : 'Evidence-first analysis'}</span>{githubLogin ? <button className="nav-link" onClick={() => void handleLogout()}>@{githubLogin} · Sign out</button> : <button className="nav-link" disabled={!oauthConfigured} onClick={loginWithGitHub}>{oauthConfigured ? 'Sign in with GitHub' : 'GitHub sign-in unavailable'}</button>}<button className="nav-link" onClick={handleDemo}>Explore sample <ArrowRight size={15} /></button></div>
+          <div className="nav-right"><span className="nav-status"><span className={`status-dot ${apiHealth?.ready ? '' : 'muted-dot'}`} /> {apiHealth?.ready ? 'Neo4j graph ready' : 'Evidence-first analysis'}</span>{githubLogin ? <button className="nav-link" onClick={() => void handleLogout()}>@{githubLogin} · Sign out</button> : <button className="nav-link" onClick={openAuthDialog}>Sign in</button>}<button className="nav-link" onClick={handleDemo}>Explore sample <ArrowRight size={15} /></button></div>
         </header>
         <div className="landing-grid" id="top">
           <section className="hero-copy">
@@ -561,7 +605,7 @@ function App() {
         <header className="workspace-topbar">
           <a className="brand" href="#top" onClick={(event) => { event.preventDefault(); leaveCurrentRepository() }}><span className="brand-mark"><Graph size={16} weight="bold" /></span><span>why<span className="brand-period">.</span></span></a>
           <div className="repo-crumb"><span className="crumb-slash">/</span><GithubLogo size={15} weight="fill" /><b>{activeRepository?.fullName ?? 'vercel / next.js'}</b><span className="sample-tag">{activeRepository ? 'INDEXED' : 'SAMPLE'}</span><CaretDown size={13} /></div>
-          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? activeIsSaved ? 'Saved index' : 'Temporary index' : 'Preview data only'}</span>{activeRepository && !activeIsSaved && <button className="topbar-save" disabled={!githubLogin && !oauthConfigured} onClick={() => void handleSaveIndex()}>{githubLogin ? 'Save index' : 'Sign in to save'}</button>}{githubLogin && <button className="topbar-account" onClick={() => void handleLogout()}>@{githubLogin}</button>}{activeRepository && <button className="topbar-icon" aria-label="Remove repository index" title="Remove repository graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={leaveCurrentRepository}><Plus size={16} /> New repo</button></div>
+          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? activeIsSaved ? 'Saved index' : 'Temporary index' : 'Preview data only'}</span>{activeRepository && !activeIsSaved && <button className="topbar-save" onClick={() => void handleSaveIndex()}>{githubLogin ? 'Save index' : 'Sign in to save'}</button>}{githubLogin && <button className="topbar-account" onClick={() => void handleLogout()}>@{githubLogin}</button>}{activeRepository && <button className="topbar-icon" aria-label="Remove repository index" title="Remove repository graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={leaveCurrentRepository}><Plus size={16} /> New repo</button></div>
         </header>
         <div className="workspace-body">
           <aside className="left-rail">
@@ -616,6 +660,31 @@ function App() {
         </div>
       </section>}
       {notice && workspace && <div className="toast" role="status"><CheckCircle size={16} />{notice}<button aria-label="Dismiss notification" onClick={() => setNotice('')}><X size={14} /></button></div>}
+      {showAuth && <div className="auth-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowAuth(false) }}>
+        <section className="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+          <button className="auth-close" aria-label="Close sign in" onClick={() => setShowAuth(false)}><X size={17} /></button>
+          <span className="auth-eyebrow">YOUR REPOSITORY CONTEXT</span>
+          <h2 id="auth-title">Sign in to Why</h2>
+          <p>Choose a provider. You can save repository indexes to your account when you decide to.</p>
+          <button className="auth-provider" disabled={!githubOAuthConfigured} onClick={loginWithGitHub}><GithubLogo size={17} weight="fill" /> Continue with GitHub {!githubOAuthConfigured && <small>Not configured</small>}</button>
+          <button className="auth-provider" disabled={!googleOAuthConfigured} onClick={loginWithGoogle}><GoogleLogo size={17} /> Continue with Google {!googleOAuthConfigured && <small>Not configured</small>}</button>
+          <div className="auth-divider"><span />or use email<span /></div>
+          {authStep === 'email' ? <form className="auth-email-form" onSubmit={(event) => void handleRequestEmailCode(event)}>
+            <label htmlFor="auth-email">Email address</label>
+            <input id="auth-email" type="email" autoComplete="email" required maxLength={254} value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="you@example.com" disabled={!emailAuthConfigured || authBusy} />
+            {!emailAuthConfigured && <small>Email sign-in becomes available after SMTP is configured.</small>}
+            <button className="auth-submit" type="submit" disabled={!emailAuthConfigured || authBusy || !authEmail.trim()}>{authBusy ? 'Sending code…' : 'Email me a sign-in code'}</button>
+            <small>First time? A verified email code creates your account. Returning users can use the same flow.</small>
+          </form> : <form className="auth-email-form" onSubmit={(event) => void handleVerifyEmailCode(event)}>
+            <label htmlFor="auth-code">6-digit code sent to {authEmail}</label>
+            <input id="auth-code" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} required value={authCode} onChange={(event) => setAuthCode(event.target.value.replace(/\D/g, '').slice(0, 6))} placeholder="000000" disabled={authBusy} />
+            <button className="auth-submit" type="submit" disabled={authBusy || authCode.length !== 6}>{authBusy ? 'Verifying…' : 'Verify and sign in'}</button>
+            <button type="button" className="auth-back" onClick={() => setAuthStep('email')} disabled={authBusy}>Change email or request another code</button>
+          </form>}
+          <div className="auth-privacy"><ShieldCheck size={14} /> Email codes expire after 10 minutes and can only be used once.</div>
+          {authMessage && <p className="auth-message" role="status">{authMessage}</p>}
+        </section>
+      </div>}
     </main>
   )
 }
