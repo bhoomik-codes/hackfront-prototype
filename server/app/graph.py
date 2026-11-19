@@ -1,0 +1,611 @@
+import hashlib
+from datetime import UTC, datetime
+from typing import Any
+
+from neo4j import AsyncDriver
+
+SCHEMA = (
+    "CREATE CONSTRAINT repository_id IF NOT EXISTS FOR (n:Repository) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT directory_id IF NOT EXISTS FOR (n:Directory) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT file_id IF NOT EXISTS FOR (n:File) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT commit_id IF NOT EXISTS FOR (n:Commit) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT pull_request_id IF NOT EXISTS FOR (n:PullRequest) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT issue_id IF NOT EXISTS FOR (n:Issue) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT comment_id IF NOT EXISTS FOR (n:Comment) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT person_id IF NOT EXISTS FOR (n:Person) REQUIRE n.id IS UNIQUE",
+    "CREATE INDEX directory_repository IF NOT EXISTS FOR (n:Directory) ON (n.repository_id)",
+    "CREATE INDEX file_repository IF NOT EXISTS FOR (n:File) ON (n.repository_id)",
+    "CREATE INDEX commit_repository IF NOT EXISTS FOR (n:Commit) ON (n.repository_id)",
+    "CREATE INDEX pull_request_repository IF NOT EXISTS FOR (n:PullRequest) ON (n.repository_id)",
+    "CREATE INDEX issue_repository IF NOT EXISTS FOR (n:Issue) ON (n.repository_id)",
+    "CREATE INDEX comment_repository IF NOT EXISTS FOR (n:Comment) ON (n.repository_id)",
+    "CREATE INDEX person_repository IF NOT EXISTS FOR (n:Person) ON (n.repository_id)",
+)
+
+
+def _short(value: object, limit: int = 12_000) -> str:
+    return value.replace("\x00", "")[:limit] if isinstance(value, str) else ""
+
+
+def _user(
+    person: object, repository_id: str, people: dict[str, dict[str, Any]]
+) -> str | None:
+    if not isinstance(person, dict):
+        return None
+    login = _short(person.get("login"), 100)
+    if not login:
+        return None
+    identity = f"{repository_id}:person:{login.lower()}"
+    people[identity] = {
+        "id": identity,
+        "repository_id": repository_id,
+        "login": login,
+        "url": _short(person.get("html_url"), 500),
+    }
+    return identity
+
+
+async def _upsert_nodes(
+    transaction: Any, label: str, rows: list[dict[str, Any]]
+) -> None:
+    if not rows:
+        return
+    query = f"UNWIND $rows AS row MERGE (n:{label} {{id: row.id}}) SET n += row"
+    for start in range(0, len(rows), 400):
+        await transaction.run(query, rows=rows[start : start + 400]).consume()
+
+
+async def _upsert_edges(
+    transaction: Any, relationship: str, rows: list[dict[str, str]]
+) -> None:
+    if not rows:
+        return
+    query = (
+        "UNWIND $rows AS row "
+        "MATCH (a {id: row.source, repository_id: $repository_id}) "
+        "MATCH (b {id: row.target, repository_id: $repository_id}) "
+        f"MERGE (a)-[:{relationship}]->(b)"
+    )
+    for start in range(0, len(rows), 500):
+        await transaction.run(
+            query,
+            rows=rows[start : start + 500],
+            repository_id=rows[0]["repository_id"],
+        ).consume()
+
+
+async def index_repository(
+    driver: AsyncDriver, database: str, data: dict[str, object], workspace_id: str
+) -> dict[str, int]:
+    repository = data["repository"]
+    if not isinstance(repository, dict):
+        raise TypeError("Repository metadata is missing")
+    owner = repository.get("owner") if isinstance(repository.get("owner"), dict) else {}
+    owner_name = _short(owner.get("login"), 100)
+    full_name = _short(repository.get("full_name"), 220)
+    repository_id = f"{workspace_id}:github.com/{full_name.lower()}"
+    default_branch = _short(data.get("default_branch"), 200)
+    indexed_at = datetime.now(UTC).isoformat()
+
+    async with driver.session(database=database) as session:
+        for statement in SCHEMA:
+            await session.run(statement).consume()
+
+    repo_node = [
+        {
+            "id": repository_id,
+            "repository_id": repository_id,
+            "name": full_name,
+            "owner": owner_name,
+            "url": _short(repository.get("html_url"), 500),
+            "description": _short(repository.get("description"), 2_000),
+            "default_branch": default_branch,
+            "stars": repository.get("stargazers_count")
+            if isinstance(repository.get("stargazers_count"), int)
+            else 0,
+            "indexed_at": indexed_at,
+            "tree_truncated": bool(data.get("tree_truncated")),
+            "kind": "repository",
+        }
+    ]
+    directories = data.get("directories", [])
+    files = data.get("files", [])
+    imports = data.get("imports", [])
+    commits = data.get("commits", [])
+    changed_files = data.get("commit_files", [])
+    pull_requests = data.get("pull_requests", [])
+    issues = data.get("issues", [])
+    comments = data.get("comments", [])
+
+    directory_rows: list[dict[str, Any]] = []
+    containment: list[dict[str, str]] = []
+    file_by_path: dict[str, dict[str, Any]] = {}
+    for path in directories if isinstance(directories, list) else []:
+        if not isinstance(path, str):
+            continue
+        identity = f"{repository_id}:dir:{path}"
+        directory_rows.append(
+            {
+                "id": identity,
+                "repository_id": repository_id,
+                "name": path.rsplit("/", 1)[-1],
+                "path": path,
+                "kind": "module",
+                "description": f"Directory in {full_name}",
+            }
+        )
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        parent_id = f"{repository_id}:dir:{parent}" if parent else repository_id
+        containment.append(
+            {"repository_id": repository_id, "source": parent_id, "target": identity}
+        )
+    for entry in files if isinstance(files, list) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            continue
+        path = entry["path"]
+        identity = f"{repository_id}:file:{path}"
+        file_row = {
+            "id": identity,
+            "repository_id": repository_id,
+            "name": path.rsplit("/", 1)[-1],
+            "path": path,
+            "kind": "file",
+            "language": _language_from_path(path),
+            "description": f"Source file in {full_name}",
+        }
+        file_by_path[path] = file_row
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        parent_id = f"{repository_id}:dir:{parent}" if parent else repository_id
+        containment.append(
+            {"repository_id": repository_id, "source": parent_id, "target": identity}
+        )
+
+    for entry in changed_files if isinstance(changed_files, list) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str):
+            continue
+        path = entry["filename"]
+        identity = f"{repository_id}:file:{path}"
+        if identity not in {row["id"] for row in file_by_path.values()}:
+            file_by_path[path] = {
+                "id": identity,
+                "repository_id": repository_id,
+                "name": path.rsplit("/", 1)[-1],
+                "path": path,
+                "kind": "file",
+                "language": _language_from_path(path),
+                "description": "File referenced by repository history",
+                "historical_only": True,
+            }
+            parent = path.rsplit("/", 1)[0] if "/" in path else ""
+            parent_id = f"{repository_id}:dir:{parent}" if parent else repository_id
+            containment.append(
+                {
+                    "repository_id": repository_id,
+                    "source": parent_id,
+                    "target": identity,
+                }
+            )
+
+    person_nodes: dict[str, dict[str, Any]] = {}
+    commit_rows: list[dict[str, Any]] = []
+    changes_edges: list[dict[str, str]] = []
+    author_edges: list[dict[str, str]] = []
+    for commit in commits if isinstance(commits, list) else []:
+        if not isinstance(commit, dict):
+            continue
+        sha = _short(commit.get("sha"), 64)
+        details = commit.get("commit") if isinstance(commit.get("commit"), dict) else {}
+        author_info = (
+            details.get("author") if isinstance(details.get("author"), dict) else {}
+        )
+        user_id = _user(commit.get("author"), repository_id, person_nodes)
+        identity = f"{repository_id}:commit:{sha}"
+        commit_rows.append(
+            {
+                "id": identity,
+                "repository_id": repository_id,
+                "sha": sha,
+                "name": sha[:7],
+                "message": _short(details.get("message"), 4_000),
+                "author": _short(author_info.get("name"), 200),
+                "date": _short(author_info.get("date"), 60),
+                "url": _short(commit.get("html_url"), 500),
+                "kind": "commit",
+            }
+        )
+        if user_id:
+            # AUTHOR edges are assembled after all people are written.
+            author_edges.append(
+                {"repository_id": repository_id, "source": user_id, "target": identity}
+            )
+        for changed in changed_files if isinstance(changed_files, list) else []:
+            if (
+                not isinstance(changed, dict)
+                or _short(changed.get("_commit_sha"), 64) != sha
+            ):
+                continue
+            path = changed.get("filename")
+            if isinstance(path, str):
+                file_id = f"{repository_id}:file:{path}"
+                changes_edges.append(
+                    {
+                        "repository_id": repository_id,
+                        "source": identity,
+                        "target": file_id,
+                    }
+                )
+
+    pull_rows: list[dict[str, Any]] = []
+    pull_edges: list[dict[str, str]] = []
+    for record in pull_requests if isinstance(pull_requests, list) else []:
+        if not isinstance(record, dict):
+            continue
+        pull = record.get("pull") if isinstance(record.get("pull"), dict) else {}
+        number = pull.get("number")
+        if not isinstance(number, int) or number <= 0:
+            continue
+        identity = f"{repository_id}:pr:{number}"
+        pull_rows.append(
+            {
+                "id": identity,
+                "repository_id": repository_id,
+                "number": number,
+                "name": f"PR #{number}",
+                "title": _short(pull.get("title"), 500),
+                "body": _short(pull.get("body"), 8_000),
+                "state": _short(pull.get("state"), 30),
+                "merged_at": _short(pull.get("merged_at"), 60),
+                "updated_at": _short(pull.get("updated_at"), 60),
+                "url": _short(pull.get("html_url"), 500),
+                "kind": "pull_request",
+            }
+        )
+        user_id = _user(pull.get("user"), repository_id, person_nodes)
+        if user_id:
+            author_edges.append(
+                {"repository_id": repository_id, "source": user_id, "target": identity}
+            )
+        files_for_pull = (
+            record.get("files") if isinstance(record.get("files"), list) else []
+        )
+        for changed in files_for_pull:
+            if isinstance(changed, dict) and isinstance(changed.get("filename"), str):
+                path = changed["filename"]
+                file_id = f"{repository_id}:file:{path}"
+                if path not in file_by_path:
+                    file_by_path[path] = {
+                        "id": file_id,
+                        "repository_id": repository_id,
+                        "name": path.rsplit("/", 1)[-1],
+                        "path": path,
+                        "kind": "file",
+                        "language": _language_from_path(path),
+                        "description": "File referenced by pull request history",
+                        "historical_only": True,
+                    }
+                pull_edges.append(
+                    {
+                        "repository_id": repository_id,
+                        "source": identity,
+                        "target": file_id,
+                    }
+                )
+
+    issue_rows: list[dict[str, Any]] = []
+    issue_edges: list[dict[str, str]] = []
+    for issue in issues if isinstance(issues, list) else []:
+        if not isinstance(issue, dict) or not isinstance(issue.get("number"), int):
+            continue
+        number = issue["number"]
+        identity = f"{repository_id}:issue:{number}"
+        issue_rows.append(
+            {
+                "id": identity,
+                "repository_id": repository_id,
+                "number": number,
+                "name": f"Issue #{number}",
+                "title": _short(issue.get("title"), 500),
+                "body": _short(issue.get("body"), 8_000),
+                "state": _short(issue.get("state"), 30),
+                "updated_at": _short(issue.get("updated_at"), 60),
+                "url": _short(issue.get("html_url"), 500),
+                "kind": "issue",
+            }
+        )
+        linked_by = issue.get("referenced_by_pull")
+        if isinstance(linked_by, int):
+            issue_edges.append(
+                {
+                    "repository_id": repository_id,
+                    "source": f"{repository_id}:pr:{linked_by}",
+                    "target": identity,
+                }
+            )
+
+    comment_rows: list[dict[str, Any]] = []
+    comment_edges: list[dict[str, str]] = []
+    for index, comment in enumerate(comments if isinstance(comments, list) else []):
+        if not isinstance(comment, dict):
+            continue
+        number = comment.get("pull_number")
+        body = _short(comment.get("body"), 6_000)
+        if not isinstance(number, int) or not body:
+            continue
+        source_id = _short(comment.get("html_url"), 500) or f"{number}:{index}"
+        stable_id = hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:24]
+        identity = f"{repository_id}:comment:{stable_id}"
+        author = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        user_id = _user(author, repository_id, person_nodes)
+        review_state = _short(comment.get("state"), 40)
+        kind = (
+            "review"
+            if review_state
+            else (
+                "inline_review"
+                if isinstance(comment.get("path"), str)
+                else "discussion"
+            )
+        )
+        comment_rows.append(
+            {
+                "id": identity,
+                "repository_id": repository_id,
+                "name": f"Comment on PR #{number}",
+                "body": body,
+                "kind": kind,
+                "path": _short(comment.get("path"), 500),
+                "line": comment.get("line")
+                if isinstance(comment.get("line"), int)
+                else None,
+                "date": _short(
+                    comment.get("submitted_at") or comment.get("created_at"), 60
+                ),
+                "url": source_id,
+            }
+        )
+        comment_edges.append(
+            {
+                "repository_id": repository_id,
+                "source": f"{repository_id}:pr:{number}",
+                "target": identity,
+            }
+        )
+        if user_id:
+            author_edges.append(
+                {"repository_id": repository_id, "source": user_id, "target": identity}
+            )
+
+    import_edges = [
+        {
+            "repository_id": repository_id,
+            "source": f"{repository_id}:file:{source}",
+            "target": f"{repository_id}:file:{target}",
+        }
+        for source, target in imports
+        if isinstance(source, str) and isinstance(target, str)
+    ]
+
+    async def write_snapshot(transaction: Any) -> None:
+        for label in (
+            "Comment",
+            "Issue",
+            "PullRequest",
+            "Commit",
+            "Person",
+            "File",
+            "Directory",
+            "Repository",
+        ):
+            await transaction.run(
+                f"MATCH (n:{label} {{repository_id: $repository_id}}) DETACH DELETE n",
+                repository_id=repository_id,
+            ).consume()
+        for label, rows in (
+            ("Repository", repo_node),
+            ("Directory", directory_rows),
+            ("File", list(file_by_path.values())),
+            ("Commit", commit_rows),
+            ("PullRequest", pull_rows),
+            ("Issue", issue_rows),
+            ("Comment", comment_rows),
+            ("Person", list(person_nodes.values())),
+        ):
+            await _upsert_nodes(transaction, label, rows)
+        for relationship, rows in (
+            ("CONTAINS", containment),
+            ("IMPORTS", import_edges),
+            ("CHANGES", changes_edges),
+            ("AUTHORED", author_edges),
+            ("MODIFIES", pull_edges),
+            ("REFERENCES", issue_edges),
+            ("HAS_COMMENT", comment_edges),
+        ):
+            await _upsert_edges(transaction, relationship, rows)
+
+    async with driver.session(database=database) as session:
+        await session.execute_write(write_snapshot)
+
+    return {
+        "files": len(file_by_path),
+        "directories": len(directory_rows),
+        "imports": len(import_edges),
+        "commits": len(commit_rows),
+        "pull_requests": len(pull_rows),
+        "issues": len(issue_rows),
+        "discussion_records": len(comment_rows),
+    }
+
+
+def _language_from_path(path: str) -> str:
+    extension = (
+        path.rsplit(".", 1)[-1].lower() if "." in path.rsplit("/", 1)[-1] else ""
+    )
+    return {
+        "js": "JavaScript",
+        "jsx": "JavaScript",
+        "mjs": "JavaScript",
+        "ts": "TypeScript",
+        "tsx": "TypeScript",
+        "py": "Python",
+        "go": "Go",
+        "rs": "Rust",
+        "java": "Java",
+        "cs": "C#",
+        "rb": "Ruby",
+        "php": "PHP",
+        "json": "JSON",
+        "toml": "TOML",
+        "yaml": "YAML",
+        "yml": "YAML",
+    }.get(extension, "Other")
+
+
+async def read_repository_graph(
+    driver: AsyncDriver, database: str, repository_id: str, mode: str, limit: int = 350
+) -> dict[str, object]:
+    labels = (
+        ["Repository", "Directory", "File"]
+        if mode == "architecture"
+        else ["File", "Commit", "PullRequest", "Issue", "Comment", "Person"]
+    )
+    node_query = (
+        "MATCH (n) WHERE n.repository_id = $repository_id AND any(label IN labels(n) WHERE label IN $labels) "
+        "RETURN labels(n) AS labels, properties(n) AS props "
+        "ORDER BY CASE "
+        "WHEN 'Repository' IN labels(n) THEN 0 "
+        "WHEN $mode = 'architecture' AND 'Directory' IN labels(n) THEN 1 "
+        "WHEN $mode = 'architecture' AND 'File' IN labels(n) THEN 2 "
+        "WHEN $mode = 'decisions' AND 'PullRequest' IN labels(n) THEN 0 "
+        "WHEN $mode = 'decisions' AND 'Commit' IN labels(n) THEN 1 "
+        "WHEN $mode = 'decisions' AND 'Issue' IN labels(n) THEN 2 "
+        "WHEN $mode = 'decisions' AND 'Comment' IN labels(n) THEN 3 "
+        "WHEN $mode = 'decisions' AND 'File' IN labels(n) THEN 4 "
+        "ELSE 5 END, n.number DESC, n.date DESC, n.updated_at DESC, n.path LIMIT $limit"
+    )
+    records, _, _ = await driver.execute_query(
+        node_query,
+        repository_id=repository_id,
+        labels=labels,
+        mode=mode,
+        limit=limit,
+        database_=database,
+    )
+    nodes: list[dict[str, object]] = []
+    ids: list[str] = []
+    repo_meta: dict[str, object] = {}
+    for record in records:
+        props = dict(record["props"])
+        identity = str(props.get("id", ""))
+        node_labels = record["labels"]
+        kind = str(
+            props.get("kind")
+            or next(
+                (label.lower() for label in node_labels if label != "Repository"),
+                "repository",
+            )
+        )
+        node = {
+            "id": identity,
+            "label": str(
+                props.get("title") or props.get("name") or props.get("path") or identity
+            ),
+            "kind": kind,
+            "path": props.get("path"),
+            "description": props.get("description")
+            or props.get("body")
+            or props.get("message"),
+            "metadata": {
+                key: value
+                for key, value in props.items()
+                if isinstance(value, (str, int, bool))
+                and key
+                not in {
+                    "id",
+                    "repository_id",
+                    "name",
+                    "title",
+                    "description",
+                    "body",
+                    "message",
+                    "path",
+                }
+            },
+        }
+        nodes.append(node)
+        ids.append(identity)
+        if "Repository" in node_labels:
+            repo_meta = {
+                key: props.get(key)
+                for key in (
+                    "name",
+                    "owner",
+                    "url",
+                    "description",
+                    "default_branch",
+                    "stars",
+                    "indexed_at",
+                    "tree_truncated",
+                )
+            }
+
+    edge_query = (
+        "MATCH (a {repository_id: $repository_id})-[relationship]->(b {repository_id: $repository_id}) "
+        "WHERE a.id IN $ids AND b.id IN $ids "
+        "RETURN a.id AS source, b.id AS target, type(relationship) AS kind LIMIT $edge_limit"
+    )
+    edges_result, _, _ = await driver.execute_query(
+        edge_query,
+        repository_id=repository_id,
+        ids=ids,
+        edge_limit=900,
+        database_=database,
+    )
+    edges = [
+        {
+            "id": f"{item['source']}:{item['kind']}:{item['target']}",
+            "source": item["source"],
+            "target": item["target"],
+            "kind": item["kind"],
+            "label": item["kind"].replace("_", " ").lower(),
+        }
+        for item in edges_result
+    ]
+    coverage_query = "MATCH (n {repository_id: $repository_id}) RETURN labels(n) AS labels, count(n) AS amount"
+    coverage_records, _, _ = await driver.execute_query(
+        coverage_query, repository_id=repository_id, database_=database
+    )
+    coverage: dict[str, int | bool | str] = {"repository": repository_id}
+    for item in coverage_records:
+        for label in item["labels"]:
+            coverage[label.lower()] = int(item["amount"])
+    return {
+        "repository": repo_meta,
+        "nodes": nodes,
+        "edges": edges,
+        "coverage": coverage,
+    }
+
+
+async def delete_repository_graph(
+    driver: AsyncDriver, database: str, repository_id: str
+) -> None:
+    labels = (
+        "Comment",
+        "Issue",
+        "PullRequest",
+        "Commit",
+        "Person",
+        "File",
+        "Directory",
+        "Repository",
+    )
+
+    async def delete_snapshot(transaction: Any) -> None:
+        for label in labels:
+            await transaction.run(
+                f"MATCH (n:{label} {{repository_id: $repository_id}}) DETACH DELETE n",
+                repository_id=repository_id,
+            ).consume()
+
+    async with driver.session(database=database) as session:
+        await session.execute_write(delete_snapshot)

@@ -1,0 +1,18 @@
+[project]
+name = "server"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.165.0",
+    "httpx>=0.28.1",
+    "neo4j>=6.4.1",
+    "pydantic-settings>=2.16.3",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "bandit>=1.9.4",
+    "pip-audit>=2.10.1",
+    "ruff>=0.17.5",
+]

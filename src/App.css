@@ -28,6 +28,9 @@ a { color: inherit; text-decoration: none; }
 .repo-form button:hover { background: #e0ff83; transform: translateY(-1px); }
 .form-caption { margin: 12px 0 0 2px; color: #798075; font-size: 10px; letter-spacing: .01em; }
 .form-caption svg { color: #9ead7e; }
+.storage-consent { display: flex; align-items: flex-start; gap: 9px; width: min(100%, 560px); margin: 13px 0 0 2px; color: #aab09f; font-size: 11px; line-height: 1.5; cursor: pointer; }
+.storage-consent input { flex: 0 0 auto; margin: 2px 0 0; accent-color: var(--accent); }
+.storage-consent:focus-within { color: #e4e8da; }
 .folder-entry { display: flex; align-items: center; gap: 9px; margin-top: 22px; padding: 0; background: transparent; color: #81887c; font-size: 11px; }
 .folder-entry > span { display: inline-flex; align-items: center; gap: 6px; color: #c0c5b9; border-bottom: 1px solid #51584b; padding-bottom: 2px; }
 .folder-entry:hover > span { color: var(--accent); border-color: var(--accent); }
