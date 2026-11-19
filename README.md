@@ -10,7 +10,7 @@ Repository intelligence that connects source code to the decisions and history b
 
 **Phase 3 — Evidence assistant with BYOK.** The assistant can answer questions from connected commits, pull requests, issues, discussions, and selected file content. It only accepts citation IDs present in the retrieved graph and declines answers with no verifiable citations. OpenAI-compatible providers are called directly from the browser after per-question consent. The API key stays in memory for the current tab and is not stored in browser storage or sent to this app's API. Confidence is based on the number and variety of validated citations, not the model's self-rating.
 
-**Phase 4 — Persistent browser workspace.** Indexed repositories can be reopened after a refresh from a list scoped to the signed browser workspace. Users can remove a repository graph from Aura from the workspace.
+**Phase 4 — Temporary browser workspace.** Anonymous repository graphs are available only while the browser workspace is active. The app requests cleanup on exit, deletes the current index when leaving it, and expires inactive graphs after two hours. A periodic Aura cleanup removes expired and legacy anonymous graph data.
 
 **Phase 5 — Conservative supersession links.** A later pull request or its discussion creates a `SUPERSEDES` relationship only when its text explicitly uses replacement/deprecation/revert language near a reference to an older pull request in the indexed window. The workspace highlights both ends of that link. No link is treated as proof that an older decision remains current.
 
@@ -46,9 +46,11 @@ npm audit
 - Repository code is never executed during indexing.
 - Cloud graph storage and AI providers must be disclosed and opt-in.
 - Each browser receives an anonymous, signed, HTTP-only workspace session; repository graph reads and deletion are scoped to that session.
+- There is no account login or persistent-save feature yet, so every repository index is temporary and is removed on exit or after inactivity.
 - Model API keys are held in page memory only. The user must opt in before repository evidence is sent to a model provider.
 - Graph and assistant coverage is bounded and cannot guarantee a complete history or a correct interpretation of intent. Inspect linked source records before relying on conclusions.
 - Supersession detection is deliberately limited to explicit wording and pull request references; it is not a semantic decision classifier. Absence of a detected link is inconclusive.
+- Persistent retention must only be added alongside account authentication and a separate explicit save action.
 
 ## Indexing limits
 

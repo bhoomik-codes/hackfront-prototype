@@ -1,6 +1,6 @@
 import hashlib
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from neo4j import AsyncDriver
@@ -22,6 +22,7 @@ SCHEMA = (
     "CREATE INDEX comment_repository IF NOT EXISTS FOR (n:Comment) ON (n.repository_id)",
     "CREATE INDEX person_repository IF NOT EXISTS FOR (n:Person) ON (n.repository_id)",
 )
+TEMPORARY_GRAPH_TTL = timedelta(hours=2)
 
 _OVERRIDE_TERMS = r"supersed\w*|replac\w*|deprecat\w*|revert\w*|no longer"
 _OVERRIDE_BEFORE_REFERENCE = re.compile(
@@ -112,6 +113,7 @@ async def index_repository(
     repository_id = f"{workspace_id}:github.com/{full_name.lower()}"
     default_branch = _short(data.get("default_branch"), 200)
     indexed_at = datetime.now(UTC).isoformat()
+    expires_at = (datetime.now(UTC) + TEMPORARY_GRAPH_TTL).isoformat()
 
     async with driver.session(database=database) as session:
         for statement in SCHEMA:
@@ -131,6 +133,7 @@ async def index_repository(
             if isinstance(repository.get("stargazers_count"), int)
             else 0,
             "indexed_at": indexed_at,
+            "expires_at": expires_at,
             "tree_truncated": bool(data.get("tree_truncated")),
             "kind": "repository",
         }
@@ -682,11 +685,12 @@ async def list_workspace_repositories(
     driver: AsyncDriver, database: str, workspace_id: str
 ) -> list[dict[str, str | None]]:
     rows, _, _ = await driver.execute_query(
-        "MATCH (r:Repository) WHERE r.repository_id STARTS WITH $prefix "
+        "MATCH (r:Repository) WHERE r.repository_id STARTS WITH $prefix AND r.expires_at > $now "
         "RETURN r.owner AS owner, r.name AS full_name, r.description AS description, "
         "r.default_branch AS default_branch, r.indexed_at AS indexed_at "
         "ORDER BY r.indexed_at DESC LIMIT 50",
         prefix=f"{workspace_id}:github.com/",
+        now=datetime.now(UTC).isoformat(),
         database_=database,
     )
     repositories: list[dict[str, str | None]] = []
@@ -707,3 +711,52 @@ async def list_workspace_repositories(
             }
         )
     return repositories
+
+
+async def touch_repository_graph(
+    driver: AsyncDriver, database: str, repository_id: str
+) -> bool:
+    expires_at = (datetime.now(UTC) + TEMPORARY_GRAPH_TTL).isoformat()
+    rows, _, _ = await driver.execute_query(
+        "MATCH (r:Repository {id: $id}) WHERE r.expires_at > $now "
+        "SET r.expires_at = $expires_at "
+        "RETURN r.id AS id LIMIT 1",
+        id=repository_id,
+        now=datetime.now(UTC).isoformat(),
+        expires_at=expires_at,
+        database_=database,
+    )
+    return bool(rows)
+
+
+async def delete_expired_repository_graphs(
+    driver: AsyncDriver, database: str, limit: int = 100
+) -> int:
+    now = datetime.now(UTC).isoformat()
+    rows, _, _ = await driver.execute_query(
+        "MATCH (r:Repository) WHERE r.repository_id CONTAINS ':github.com/' "
+        "AND (r.expires_at IS NULL OR r.expires_at <= $now) "
+        "RETURN r.id AS id LIMIT $limit",
+        now=now,
+        limit=limit,
+        database_=database,
+    )
+    expired_ids = [str(row["id"]) for row in rows]
+    for repository_id in expired_ids:
+        await delete_repository_graph(driver, database, repository_id)
+    return len(expired_ids)
+
+
+async def delete_workspace_repositories(
+    driver: AsyncDriver, database: str, workspace_id: str
+) -> int:
+    rows, _, _ = await driver.execute_query(
+        "MATCH (r:Repository) WHERE r.repository_id STARTS WITH $prefix "
+        "RETURN r.id AS id LIMIT 100",
+        prefix=f"{workspace_id}:github.com/",
+        database_=database,
+    )
+    repository_ids = [str(row["id"]) for row in rows]
+    for repository_id in repository_ids:
+        await delete_repository_graph(driver, database, repository_id)
+    return len(repository_ids)

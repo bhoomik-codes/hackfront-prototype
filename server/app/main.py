@@ -1,23 +1,28 @@
+import asyncio
 import logging
 import secrets
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import DriverError, Neo4jError
 
 from .config import get_settings
 from .github import GitHubError, GitHubIndexer, parse_repository_url
 from .graph import (
+    delete_expired_repository_graphs,
     delete_repository_graph,
+    delete_workspace_repositories,
     index_repository,
     list_workspace_repositories,
     read_repository_graph,
+    touch_repository_graph,
 )
 from .schemas import (
     AnalyzeAccepted,
@@ -46,6 +51,19 @@ if settings.neo4j_configured and (
 session_secret = settings.session_secret or secrets.token_urlsafe(48)
 
 
+async def _expiry_sweeper(driver) -> None:
+    while True:
+        try:
+            removed = await delete_expired_repository_graphs(
+                driver, settings.neo4j_database
+            )
+            if removed:
+                logger.info("Removed %s expired temporary repository graph(s)", removed)
+        except (DriverError, Neo4jError, ExceptionGroup) as error:
+            logger.warning("Temporary graph cleanup failed (%s)", type(error).__name__)
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.driver = None
@@ -53,15 +71,27 @@ async def lifespan(app: FastAPI):
     app.state.import_limits: defaultdict[str, deque[float]] = defaultdict(deque)
     app.state.request_limits: defaultdict[str, deque[float]] = defaultdict(deque)
     app.state.active_jobs = set()
+    app.state.workspace_locks = {}
+    app.state.closed_workspaces = {}
+    cleanup_task = None
     if settings.neo4j_configured:
         app.state.driver = AsyncGraphDatabase.driver(
             settings.neo4j_uri,
             auth=(settings.neo4j_username, settings.neo4j_password),
             connection_timeout=8,
         )
-    yield
-    if app.state.driver is not None:
-        await app.state.driver.close()
+        cleanup_task = asyncio.create_task(_expiry_sweeper(app.state.driver))
+    try:
+        yield
+    finally:
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+        if app.state.driver is not None:
+            await app.state.driver.close()
 
 
 app = FastAPI(
@@ -149,6 +179,15 @@ def _owner_key(request: Request) -> str:
     return str(request.state.workspace_id)
 
 
+def _workspace_closed(request: Request, workspace_id: str) -> bool:
+    closed = request.app.state.closed_workspaces
+    now = time.monotonic()
+    for closed_id, expires_at in list(closed.items()):
+        if expires_at <= now:
+            closed.pop(closed_id, None)
+    return workspace_id in closed
+
+
 def _driver(request: Request):
     driver = request.app.state.driver
     if driver is None:
@@ -202,9 +241,25 @@ async def _analyze_job(
             )
 
         graph_data = await indexer.collect(owner, repository, update_progress)
-        counts = await index_repository(
-            driver, settings.neo4j_database, graph_data, _owner_key(request)
+        workspace_id = _owner_key(request)
+        lock = request.app.state.workspace_locks.setdefault(
+            workspace_id, asyncio.Lock()
         )
+        async with lock:
+            if _workspace_closed(request, workspace_id):
+                _update_job(
+                    request,
+                    job_id,
+                    status="failed",
+                    stage="cancelled",
+                    progress=100,
+                    message="The browser workspace closed before indexing finished, so no repository data was kept.",
+                    error_code="workspace_closed",
+                )
+                return
+            counts = await index_repository(
+                driver, settings.neo4j_database, graph_data, workspace_id
+            )
         repo_data = graph_data.get("repository", {})
         full_name = (
             repo_data.get("full_name", f"{owner}/{repository}")
@@ -296,7 +351,7 @@ async def health(request: Request) -> dict[str, object]:
 @app.get("/api/session")
 async def browser_session(request: Request) -> dict[str, bool]:
     existing = verify_session(request.cookies.get(SESSION_COOKIE), session_secret)
-    if existing is None:
+    if existing is None or _workspace_closed(request, existing):
         _workspace_id, token = create_session(session_secret)
         response = JSONResponse({"ready": True})
         response.set_cookie(
@@ -312,10 +367,60 @@ async def browser_session(request: Request) -> dict[str, bool]:
     return {"ready": True}
 
 
+@app.post("/api/session/cleanup", status_code=204)
+async def cleanup_browser_workspace(request: Request) -> Response:
+    workspace_id = _owner_key(request)
+    request.app.state.closed_workspaces[workspace_id] = time.monotonic() + 21_600
+    lock = request.app.state.workspace_locks.setdefault(workspace_id, asyncio.Lock())
+    driver = request.app.state.driver
+    async with lock:
+        if driver is not None:
+            try:
+                removed = await delete_workspace_repositories(
+                    driver, settings.neo4j_database, workspace_id
+                )
+                if removed:
+                    logger.info(
+                        "Removed %s temporary graph(s) for a closing browser workspace",
+                        removed,
+                    )
+            except (DriverError, Neo4jError, ExceptionGroup) as error:
+                logger.warning(
+                    "Browser workspace cleanup failed (%s)", type(error).__name__
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "workspace_cleanup_failed",
+                        "message": "Temporary repository data could not be removed yet; automatic expiry cleanup will retry.",
+                    },
+                ) from error
+    _new_workspace_id, token = create_session(session_secret)
+    response = Response(status_code=204)
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        secure=settings.secure_session_cookie,
+        samesite="strict",
+        path="/api",
+    )
+    return response
+
+
 @app.post("/api/repositories/analyze", response_model=AnalyzeAccepted, status_code=202)
 async def analyze_repository(
     payload: AnalyzeRequest, background_tasks: BackgroundTasks, request: Request
 ) -> AnalyzeAccepted:
+    if _workspace_closed(request, _owner_key(request)):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workspace_closed",
+                "message": "This browser workspace has expired. Refresh the app to start a new temporary workspace.",
+            },
+        )
     driver = _driver(request)
     try:
         await driver.verify_connectivity()
@@ -431,6 +536,26 @@ async def get_repository_graph(
     )
     driver = _driver(request)
     try:
+        exists = await touch_repository_graph(
+            driver, settings.neo4j_database, repository_id
+        )
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "graph_query_failed",
+                "message": "The repository graph could not be loaded.",
+            },
+        ) from error
+    if not exists:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "repository_not_indexed",
+                "message": "This temporary repository index has expired or was removed.",
+            },
+        )
+    try:
         graph = await read_repository_graph(
             driver, settings.neo4j_database, repository_id, mode
         )
@@ -470,8 +595,12 @@ async def get_repository_file(
     driver = _driver(request)
     try:
         rows, _, _ = await driver.execute_query(
-            "MATCH (r:Repository {id: $id}) RETURN r.default_branch AS branch LIMIT 1",
+            "MATCH (r:Repository {id: $id}) WHERE r.expires_at > $now "
+            "SET r.expires_at = $expires_at "
+            "RETURN r.default_branch AS branch LIMIT 1",
             id=repository_id,
+            now=datetime.now(UTC).isoformat(),
+            expires_at=(datetime.now(UTC) + timedelta(hours=2)).isoformat(),
             database_=settings.neo4j_database,
         )
     except (DriverError, Neo4jError, ExceptionGroup) as error:

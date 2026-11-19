@@ -246,6 +246,20 @@ function App() {
   }, [])
 
   useEffect(() => {
+    const cleanupTemporaryWorkspace = () => {
+      const payload = new Blob([], { type: 'text/plain' })
+      if (!navigator.sendBeacon('/api/session/cleanup', payload)) {
+        void fetch('/api/session/cleanup', {
+          method: 'POST', credentials: 'include', keepalive: true,
+          headers: { 'Content-Type': 'text/plain' }, body: '',
+        })
+      }
+    }
+    window.addEventListener('pagehide', cleanupTemporaryWorkspace)
+    return () => window.removeEventListener('pagehide', cleanupTemporaryWorkspace)
+  }, [])
+
+  useEffect(() => {
     try { sessionStorage.setItem('why-assistant-settings', JSON.stringify({ endpoint: assistantSettings.endpoint, model: assistantSettings.model })) } catch { /* keep settings in memory if storage is unavailable */ }
   }, [assistantSettings])
 
@@ -333,6 +347,21 @@ function App() {
     setSelectedId('routefn')
     setWorkspace(true)
     setNotice('You are viewing an illustrative sample workspace. No repository data has been fetched yet.')
+  }
+
+  const leaveCurrentRepository = () => {
+    const leaving = activeRepository
+    if (leaving) {
+      void deleteRepository(leaving.owner, leaving.repository)
+        .then(() => setSavedRepositories((repositories) => repositories.filter((repository) => repository.full_name !== leaving.fullName)))
+        .catch(() => setNotice('This temporary graph could not be deleted immediately. Automatic cleanup will remove it within two hours.'))
+    }
+    setWorkspace(false)
+    setActiveRepository(null)
+    setLiveGraph(null)
+    setCurrentSource(null)
+    setShareWithProvider(false)
+    setNotice('')
   }
 
   const openSavedRepository = (repository: RepositorySummary) => {
@@ -431,11 +460,11 @@ function App() {
               <input aria-label="Public GitHub repository URL" value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} placeholder="github.com/owner/repository" />
               <button type="submit" disabled={isIndexing}>{isIndexing ? `Indexing ${indexProgress.progress}%` : <>Analyze repo <ArrowRight size={16} /></>}</button>
             </form>
-            <label className="storage-consent"><input type="checkbox" checked={storageConsent} onChange={(event) => setStorageConsent(event.target.checked)} /><span>I agree that this app reads a bounded subset of public files and GitHub history, then stores file paths, relationships, and history records in its configured Neo4j database. Source file contents are not stored there.</span></label>
-            <div className="form-caption"><ShieldCheck size={15} /> Read-only · No code execution · Remove the stored graph at any time</div>
+            <label className="storage-consent"><input type="checkbox" checked={storageConsent} onChange={(event) => setStorageConsent(event.target.checked)} /><span>I agree that this app reads a bounded subset of public files and GitHub history, then temporarily stores file paths, relationships, and history records in its configured Neo4j database. Source file contents are not stored there. Temporary graph data is deleted when I leave or after two hours of inactivity.</span></label>
+            <div className="form-caption"><ShieldCheck size={15} /> Read-only · No code execution · All indexes are temporary; account-based saving is not enabled yet</div>
             {isIndexing && <div className="index-progress" role="status"><div className="progress-track"><span style={{ width: `${indexProgress.progress}%` }} /></div><span>{indexProgress.message}</span></div>}
             <button className="folder-entry" onClick={() => setNotice('Folder import will be available in the native app. The web version analyzes public GitHub repositories.')}> <FolderSimple size={17} /> Working with a local clone? <span>Import folder in the desktop app <ArrowRight size={14} /></span></button>
-            {savedRepositories.length > 0 && <section className="saved-repositories" aria-label="Your indexed repositories"><div className="saved-repositories-head"><b>YOUR INDEXED REPOSITORIES</b><span>SCOPED TO THIS BROWSER WORKSPACE</span></div>{savedRepositories.slice(0, 8).map((repository) => <button className="saved-repository" key={repository.full_name} onClick={() => openSavedRepository(repository)}><span className="saved-repository-icon"><GithubLogo size={14} weight="fill" /></span><span><b>{repository.full_name}</b><small>{repository.description || `Indexed ${new Date(repository.indexed_at).toLocaleDateString()} · ${repository.default_branch}`}</small></span><ArrowRight size={14} /></button>)}</section>}
+            {savedRepositories.length > 0 && <section className="saved-repositories" aria-label="Temporary repository indexes"><div className="saved-repositories-head"><b>TEMPORARY REPOSITORY INDEXES</b><span>REMOVED WHEN YOU LEAVE</span></div>{savedRepositories.slice(0, 8).map((repository) => <button className="saved-repository" key={repository.full_name} onClick={() => openSavedRepository(repository)}><span className="saved-repository-icon"><GithubLogo size={14} weight="fill" /></span><span><b>{repository.full_name}</b><small>{repository.description || `Indexed ${new Date(repository.indexed_at).toLocaleDateString()} · ${repository.default_branch}`}</small></span><ArrowRight size={14} /></button>)}</section>}
             {notice && !workspace && <p className="notice" role="status">{notice}</p>}
             <div className="hero-proof"><div className="proof-avatars"><span>G</span><span>↗</span><span>∷</span></div><span>For the code we inherit<br /><strong>and the context we lose.</strong></span></div>
           </section>
@@ -468,9 +497,9 @@ function App() {
         <footer className="landing-footer"><span>WHY THE CODE IS LIKE THIS</span><span>BUILDING CONTEXT THAT STAYS</span></footer>
       </section> : <section className="workspace">
         <header className="workspace-topbar">
-          <a className="brand" href="#top" onClick={(event) => { event.preventDefault(); setWorkspace(false) }}><span className="brand-mark"><Graph size={16} weight="bold" /></span><span>why<span className="brand-period">.</span></span></a>
+          <a className="brand" href="#top" onClick={(event) => { event.preventDefault(); leaveCurrentRepository() }}><span className="brand-mark"><Graph size={16} weight="bold" /></span><span>why<span className="brand-period">.</span></span></a>
           <div className="repo-crumb"><span className="crumb-slash">/</span><GithubLogo size={15} weight="fill" /><b>{activeRepository?.fullName ?? 'vercel / next.js'}</b><span className="sample-tag">{activeRepository ? 'INDEXED' : 'SAMPLE'}</span><CaretDown size={13} /></div>
-          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? 'Live repository data' : 'Preview data only'}</span>{activeRepository && <button className="topbar-icon" aria-label="Remove indexed repository" title="Remove indexed graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={() => { setWorkspace(false); setActiveRepository(null); setLiveGraph(null); setCurrentSource(null); setChat([{ role: 'assistant', text: 'Ask about this codebase. I’ll trace the answer back to repository evidence and call out when the graph can’t support a conclusion.' }]); setShareWithProvider(false); setNotice('') }}><Plus size={16} /> New repo</button></div>
+          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? 'Temporary index' : 'Preview data only'}</span>{activeRepository && <button className="topbar-icon" aria-label="Remove temporary repository index" title="Remove temporary graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={leaveCurrentRepository}><Plus size={16} /> New repo</button></div>
         </header>
         <div className="workspace-body">
           <aside className="left-rail">
@@ -495,7 +524,7 @@ function App() {
               <button className="graph-expand" aria-label="Fit graph" onClick={() => { const instance = document.querySelector('.graph-canvas'); instance?.dispatchEvent(new Event('fitgraph')) }}><ArrowsOut size={16} /></button>
               <div className="graph-zoom"><button onClick={() => document.querySelector('.graph-canvas')?.dispatchEvent(new Event('zoom-in'))}>+</button><span>100%</span><button onClick={() => document.querySelector('.graph-canvas')?.dispatchEvent(new Event('zoom-out'))}>−</button></div>
             </div>
-            <div className="graph-footnote"><span><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? `Indexed from ${activeRepository.fullName} · Neo4j Aura` : 'Illustrative sample · repository data not yet indexed'}</span><span>DRAG TO PAN <i /> SCROLL TO ZOOM</span></div>
+            <div className="graph-footnote"><span><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? `Temporary index · ${activeRepository.fullName} · deleted on exit or after inactivity` : 'Illustrative sample · repository data not yet indexed'}</span><span>DRAG TO PAN <i /> SCROLL TO ZOOM</span></div>
           </section>
           <aside className="inspector">
             <div className="inspector-tabs"><button className={activeSource === 'code' ? 'active' : ''} onClick={() => setActiveSource('code')}>Explore</button><button className={activeSource === 'assistant' ? 'active' : ''} onClick={() => setActiveSource('assistant')}>Assistant <Sparkle size={13} /></button><button className="inspector-close" aria-label="Close panel"><X size={16} /></button></div>
