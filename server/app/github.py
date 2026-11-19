@@ -1,6 +1,7 @@
 import asyncio
-import base64
 import re
+import time
+from collections import OrderedDict
 from pathlib import PurePosixPath
 from urllib.parse import quote, urlsplit
 
@@ -10,6 +11,12 @@ from .config import Settings
 
 GITHUB_API = "https://api.github.com"
 RAW_GITHUB = "https://raw.githubusercontent.com"
+SOURCE_CACHE_TTL_SECONDS = 300
+SOURCE_CACHE_MAX_ENTRIES = 128
+SOURCE_CHUNK_BYTES = 16_384
+_SOURCE_CACHE: OrderedDict[
+    tuple[str, str, str, str], tuple[float, dict[str, str | bool]]
+] = OrderedDict()
 REPOSITORY_PART = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 SUPPORTED_SOURCE = {
     ".c",
@@ -323,33 +330,104 @@ class GitHubIndexer:
     ) -> dict[str, str | bool]:
         if not _valid_repo_path(path) or len(path) > 500:
             raise GitHubError("invalid_file_path", "The file path is invalid.", 422)
-        endpoint = f"/repos/{quote(owner, safe='')}/{quote(repository, safe='')}/contents/{quote(path, safe='/')}"
-        response = await self._get(endpoint, {"ref": ref})
-        if (
-            not isinstance(response, dict)
-            or response.get("type") != "file"
-            or not isinstance(response.get("content"), str)
-        ):
-            raise GitHubError(
-                "unsupported_file", "This item is not a readable text file.", 415
-            )
-        encoded = response["content"]
-        if len(encoded) > self.settings.max_source_bytes * 2:
-            raise GitHubError(
-                "file_too_large", "This file is larger than the preview limit.", 413
-            )
+        cache_key = (owner.lower(), repository.lower(), ref, path)
+        now = time.monotonic()
+        cached = _SOURCE_CACHE.get(cache_key)
+        if cached is not None:
+            expires_at, source = cached
+            if expires_at > now:
+                _SOURCE_CACHE.move_to_end(cache_key)
+                return dict(source)
+            del _SOURCE_CACHE[cache_key]
+
+        url = f"{RAW_GITHUB}/{quote(owner, safe='')}/{quote(repository, safe='')}/{quote(ref, safe='/')}/{quote(path, safe='/')}"
+        chunks: list[bytes] = []
+        byte_count = 0
+        truncated = False
         try:
-            content = base64.b64decode(encoded, validate=False).decode("utf-8")
-        except (ValueError, UnicodeDecodeError) as error:
+            async with self.raw.stream(
+                "GET",
+                url,
+                headers={
+                    "Accept": "text/plain",
+                    "User-Agent": "Why-Repository-Intelligence",
+                },
+            ) as response:
+                if response.status_code == 404:
+                    raise GitHubError(
+                        "file_not_found",
+                        "The file does not exist at this revision.",
+                        404,
+                    )
+                if response.status_code in {429, 403}:
+                    raise GitHubError(
+                        "github_rate_limited",
+                        "GitHub temporarily limited this file request. Try again later.",
+                        429,
+                    )
+                if response.status_code >= 400:
+                    raise GitHubError(
+                        "github_file_unavailable",
+                        "GitHub could not return this file. Try again shortly.",
+                        502,
+                    )
+                content_length = response.headers.get("content-length")
+                if content_length and content_length.isdigit():
+                    truncated = int(content_length) > self.settings.max_source_bytes
+                async for chunk in response.aiter_bytes(SOURCE_CHUNK_BYTES):
+                    remaining = self.settings.max_source_bytes + 1 - byte_count
+                    if remaining <= 0:
+                        truncated = True
+                        break
+                    chunks.append(chunk[:remaining])
+                    byte_count += min(len(chunk), remaining)
+                    if (
+                        len(chunk) > remaining
+                        or byte_count > self.settings.max_source_bytes
+                    ):
+                        truncated = True
+                        break
+        except httpx.TimeoutException as error:
+            raise GitHubError(
+                "github_timeout",
+                "GitHub did not respond in time. Try again shortly.",
+                504,
+            ) from error
+        except httpx.HTTPError as error:
+            raise GitHubError(
+                "github_unavailable",
+                "GitHub could not be reached. Check the connection and try again.",
+                502,
+            ) from error
+        raw_content = b"".join(chunks)
+        bounded_content = raw_content[: self.settings.max_source_bytes]
+        try:
+            content = bounded_content.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            if truncated and error.end == len(bounded_content):
+                content = bounded_content[: error.start].decode("utf-8")
+            else:
+                raise GitHubError(
+                    "unsupported_file", "This file is not valid UTF-8 text.", 415
+                ) from error
+        if "\x00" in content:
             raise GitHubError(
                 "unsupported_file", "This file is not valid UTF-8 text.", 415
-            ) from error
-        return {
+            )
+        source = {
             "path": path,
             "language": _language(path),
-            "content": content[: self.settings.max_source_bytes],
-            "truncated": len(content) > self.settings.max_source_bytes,
+            "content": content,
+            "truncated": truncated or byte_count > self.settings.max_source_bytes,
         }
+        _SOURCE_CACHE[cache_key] = (
+            time.monotonic() + SOURCE_CACHE_TTL_SECONDS,
+            source,
+        )
+        _SOURCE_CACHE.move_to_end(cache_key)
+        while len(_SOURCE_CACHE) > SOURCE_CACHE_MAX_ENTRIES:
+            _SOURCE_CACHE.popitem(last=False)
+        return dict(source)
 
     async def collect(
         self, owner: str, repository: str, progress: object
