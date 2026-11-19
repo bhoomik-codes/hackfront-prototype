@@ -50,6 +50,7 @@ export type RepositorySummary = {
   description: string | null
   default_branch: string
   indexed_at: string
+  is_saved: boolean
 }
 
 export type ApiHealth = {

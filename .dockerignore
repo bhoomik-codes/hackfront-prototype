@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+node_modules
+dist
+dist-ssr
+server/.env
+.env
+.env.*
+server/.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+*.log

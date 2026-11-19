@@ -134,6 +134,8 @@ async def index_repository(
             else 0,
             "indexed_at": indexed_at,
             "expires_at": expires_at,
+            "is_saved": False,
+            "owner_user_id": None,
             "tree_truncated": bool(data.get("tree_truncated")),
             "kind": "repository",
         }
@@ -682,14 +684,17 @@ async def delete_repository_graph(
 
 
 async def list_workspace_repositories(
-    driver: AsyncDriver, database: str, workspace_id: str
+    driver: AsyncDriver, database: str, workspace_id: str, user_id: str | None = None
 ) -> list[dict[str, str | None]]:
     rows, _, _ = await driver.execute_query(
-        "MATCH (r:Repository) WHERE r.repository_id STARTS WITH $prefix AND r.expires_at > $now "
+        "MATCH (r:Repository) WHERE "
+        "(r.repository_id STARTS WITH $prefix AND r.expires_at > $now) "
+        "OR ($user_id IS NOT NULL AND r.is_saved = true AND r.owner_user_id = $user_id) "
         "RETURN r.owner AS owner, r.name AS full_name, r.description AS description, "
-        "r.default_branch AS default_branch, r.indexed_at AS indexed_at "
+        "r.default_branch AS default_branch, r.indexed_at AS indexed_at, r.is_saved AS is_saved "
         "ORDER BY r.indexed_at DESC LIMIT 50",
         prefix=f"{workspace_id}:github.com/",
+        user_id=user_id,
         now=datetime.now(UTC).isoformat(),
         database_=database,
     )
@@ -708,22 +713,81 @@ async def list_workspace_repositories(
                 "description": row.get("description"),
                 "default_branch": str(row.get("default_branch") or "main"),
                 "indexed_at": str(row.get("indexed_at") or ""),
+                "is_saved": bool(row.get("is_saved")),
             }
         )
     return repositories
 
 
 async def touch_repository_graph(
-    driver: AsyncDriver, database: str, repository_id: str
+    driver: AsyncDriver, database: str, repository_id: str, user_id: str | None = None
 ) -> bool:
     expires_at = (datetime.now(UTC) + TEMPORARY_GRAPH_TTL).isoformat()
     rows, _, _ = await driver.execute_query(
-        "MATCH (r:Repository {id: $id}) WHERE r.expires_at > $now "
-        "SET r.expires_at = $expires_at "
+        "MATCH (r:Repository {id: $id}) WHERE r.expires_at > $now OR "
+        "(r.is_saved = true AND $user_id IS NOT NULL AND r.owner_user_id = $user_id) "
+        "WITH r, CASE WHEN r.is_saved = true THEN null ELSE $expires_at END AS expiry "
+        "SET r.expires_at = expiry "
         "RETURN r.id AS id LIMIT 1",
         id=repository_id,
         now=datetime.now(UTC).isoformat(),
         expires_at=expires_at,
+        user_id=user_id,
+        database_=database,
+    )
+    return bool(rows)
+
+
+async def find_accessible_repository_id(
+    driver: AsyncDriver,
+    database: str,
+    workspace_id: str,
+    user_id: str | None,
+    full_name: str,
+) -> str | None:
+    rows, _, _ = await driver.execute_query(
+        "MATCH (r:Repository) WHERE toLower(r.name) = $full_name AND ("
+        "(r.repository_id STARTS WITH $prefix AND r.expires_at > $now) OR "
+        "($user_id IS NOT NULL AND r.is_saved = true AND r.owner_user_id = $user_id)) "
+        "RETURN r.id AS id LIMIT 1",
+        full_name=full_name.lower(),
+        prefix=f"{workspace_id}:github.com/",
+        user_id=user_id,
+        now=datetime.now(UTC).isoformat(),
+        database_=database,
+    )
+    return str(rows[0]["id"]) if rows else None
+
+
+async def find_saved_repository_id(
+    driver: AsyncDriver, database: str, user_id: str, full_name: str
+) -> str | None:
+    rows, _, _ = await driver.execute_query(
+        "MATCH (r:Repository) WHERE r.is_saved = true AND r.owner_user_id = $user_id "
+        "AND toLower(r.name) = $full_name RETURN r.id AS id LIMIT 1",
+        user_id=user_id,
+        full_name=full_name.lower(),
+        database_=database,
+    )
+    return str(rows[0]["id"]) if rows else None
+
+
+async def save_repository_graph(
+    driver: AsyncDriver,
+    database: str,
+    repository_id: str,
+    workspace_id: str,
+    user_id: str,
+) -> bool:
+    rows, _, _ = await driver.execute_query(
+        "MATCH (r:Repository {id: $id}) "
+        "WHERE r.repository_id STARTS WITH $prefix AND r.expires_at > $now "
+        "SET r.owner_user_id = $user_id, r.is_saved = true, r.expires_at = null "
+        "RETURN r.id AS id LIMIT 1",
+        id=repository_id,
+        prefix=f"{workspace_id}:github.com/",
+        now=datetime.now(UTC).isoformat(),
+        user_id=user_id,
         database_=database,
     )
     return bool(rows)
@@ -735,6 +799,7 @@ async def delete_expired_repository_graphs(
     now = datetime.now(UTC).isoformat()
     rows, _, _ = await driver.execute_query(
         "MATCH (r:Repository) WHERE r.repository_id CONTAINS ':github.com/' "
+        "AND coalesce(r.is_saved, false) = false "
         "AND (r.expires_at IS NULL OR r.expires_at <= $now) "
         "RETURN r.id AS id LIMIT $limit",
         now=now,
@@ -752,6 +817,7 @@ async def delete_workspace_repositories(
 ) -> int:
     rows, _, _ = await driver.execute_query(
         "MATCH (r:Repository) WHERE r.repository_id STARTS WITH $prefix "
+        "AND coalesce(r.is_saved, false) = false "
         "RETURN r.id AS id LIMIT 100",
         prefix=f"{workspace_id}:github.com/",
         database_=database,

@@ -1,6 +1,7 @@
 import type { AnalysisJob, ApiHealth, GraphMode, RepositoryGraphData, RepositorySource, RepositorySummary } from '../types'
 
 type ApiErrorPayload = { detail?: { message?: string; code?: string } | string }
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? ''
 
 export class RepositoryApiError extends Error {
   readonly code: string
@@ -17,7 +18,7 @@ export class RepositoryApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
-    response = await fetch(path, { ...init, credentials: 'include', headers: { 'Content-Type': 'application/json', ...init?.headers }, cache: 'no-store' })
+    response = await fetch(`${API_BASE_URL}${path}`, { ...init, credentials: 'include', headers: { 'Content-Type': 'application/json', ...init?.headers }, cache: 'no-store' })
   } catch {
     throw new RepositoryApiError('The analysis service could not be reached. Start the app’s API server and try again.', 'api_unavailable', 0)
   }
@@ -33,7 +34,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T
 }
 
-export const startBrowserSession = () => request<{ ready: boolean }>('/api/session')
+export const startBrowserSession = () => request<{ ready: boolean; authenticated?: boolean; login?: string | null; oauth_configured?: boolean }>('/api/session')
+export const loginWithGitHub = () => {
+  try { sessionStorage.setItem('why-oauth-redirect', 'true') } catch { /* redirect still works when storage is disabled */ }
+  window.location.assign(`${API_BASE_URL}/api/auth/github`)
+}
+export const logout = () => request<void>('/api/auth/logout', { method: 'POST' })
 export const checkApiHealth = () => request<ApiHealth>('/api/health')
 
 export const startRepositoryAnalysis = (repositoryUrl: string) => request<{ job_id: string; status: 'queued' }>('/api/repositories/analyze', {
@@ -57,4 +63,9 @@ export const getRepositories = () => request<RepositorySummary[]>('/api/reposito
 export const deleteRepository = (owner: string, repository: string) => request<void>(
   `/api/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}`,
   { method: 'DELETE' },
+)
+
+export const saveRepository = (owner: string, repository: string) => request<{ saved: boolean }>(
+  `/api/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/save`,
+  { method: 'POST', body: '{}' },
 )

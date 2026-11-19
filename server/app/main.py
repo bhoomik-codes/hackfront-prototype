@@ -5,11 +5,15 @@ import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from urllib.parse import urlencode
 from uuid import uuid4
 
+import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import DriverError, Neo4jError
 
@@ -19,9 +23,12 @@ from .graph import (
     delete_expired_repository_graphs,
     delete_repository_graph,
     delete_workspace_repositories,
+    find_accessible_repository_id,
+    find_saved_repository_id,
     index_repository,
     list_workspace_repositories,
     read_repository_graph,
+    save_repository_graph,
     touch_repository_graph,
 )
 from .schemas import (
@@ -32,14 +39,23 @@ from .schemas import (
     RepositoryGraph,
     RepositorySummary,
 )
-from .sessions import SESSION_COOKIE, SESSION_MAX_AGE, create_session, verify_session
+from .sessions import (
+    OAUTH_STATE_COOKIE,
+    SESSION_COOKIE,
+    SESSION_MAX_AGE,
+    create_oauth_state,
+    create_session,
+    session_claims,
+    verify_oauth_state,
+    verify_session,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
 logger = logging.getLogger("why.api")
 settings = get_settings()
-if settings.neo4j_configured and (
+if (settings.neo4j_configured or settings.github_oauth_configured) and (
     len(settings.session_secret) < 32
     or "replace-with" in settings.session_secret.lower()
     or "change-me" in settings.session_secret.lower()
@@ -47,6 +63,10 @@ if settings.neo4j_configured and (
     raise RuntimeError(
         "Set SESSION_SECRET to a private random value of at least 32 characters. "
         "A stable secret is required to preserve and safely delete browser-scoped Neo4j data."
+    )
+if settings.session_cookie_samesite == "none" and not settings.secure_session_cookie:
+    raise RuntimeError(
+        "SESSION_COOKIE_SAMESITE=none requires SECURE_SESSION_COOKIE=true."
     )
 session_secret = settings.session_secret or secrets.token_urlsafe(48)
 
@@ -113,6 +133,21 @@ app.add_middleware(
 
 @app.middleware("http")
 async def secure_api_response(request: Request, call_next):
+    if not request.url.path.startswith("/api/"):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=()"
+        )
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self' https:; font-src 'self' data:; "
+            "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; "
+            "form-action 'self' https://github.com"
+        )
+        return response
     client_key = request.client.host if request.client else "unknown-client"
     now = time.monotonic()
     requests = request.app.state.request_limits[client_key]
@@ -130,7 +165,11 @@ async def secure_api_response(request: Request, call_next):
         )
     else:
         requests.append(now)
-        if request.method == "OPTIONS" or request.url.path == "/api/session":
+        if request.method == "OPTIONS" or request.url.path in {
+            "/api/session",
+            "/api/auth/github",
+            "/api/auth/github/callback",
+        }:
             response = await call_next(request)
         else:
             workspace_id = verify_session(
@@ -148,7 +187,8 @@ async def secure_api_response(request: Request, call_next):
                 )
             elif request.method in {"POST", "DELETE", "PUT", "PATCH"}:
                 origin = request.headers.get("origin")
-                if origin not in settings.origins:
+                own_origin = f"{request.url.scheme}://{request.url.netloc}"
+                if origin not in settings.origins and origin != own_origin:
                     response = JSONResponse(
                         status_code=403,
                         content={
@@ -160,9 +200,23 @@ async def secure_api_response(request: Request, call_next):
                     )
                 else:
                     request.state.workspace_id = workspace_id
+                    claims = (
+                        session_claims(
+                            request.cookies.get(SESSION_COOKIE), session_secret
+                        )
+                        or {}
+                    )
+                    request.state.auth_user_id = claims.get("user_id")
+                    request.state.auth_login = claims.get("login")
                     response = await call_next(request)
             else:
                 request.state.workspace_id = workspace_id
+                claims = (
+                    session_claims(request.cookies.get(SESSION_COOKIE), session_secret)
+                    or {}
+                )
+                request.state.auth_user_id = claims.get("user_id")
+                request.state.auth_login = claims.get("login")
                 response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -177,6 +231,23 @@ async def secure_api_response(request: Request, call_next):
 
 def _owner_key(request: Request) -> str:
     return str(request.state.workspace_id)
+
+
+def _authenticated_user_id(request: Request) -> str | None:
+    user_id = getattr(request.state, "auth_user_id", None)
+    return str(user_id) if user_id else None
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        secure=settings.secure_session_cookie,
+        samesite=settings.session_cookie_samesite,
+        path="/api",
+    )
 
 
 def _workspace_closed(request: Request, workspace_id: str) -> bool:
@@ -349,22 +420,151 @@ async def health(request: Request) -> dict[str, object]:
 
 
 @app.get("/api/session")
-async def browser_session(request: Request) -> dict[str, bool]:
-    existing = verify_session(request.cookies.get(SESSION_COOKIE), session_secret)
+async def browser_session(request: Request) -> dict[str, object]:
+    token = request.cookies.get(SESSION_COOKIE)
+    claims = session_claims(token, session_secret)
+    existing = str(claims["workspace_id"]) if claims else None
     if existing is None or _workspace_closed(request, existing):
         _workspace_id, token = create_session(session_secret)
-        response = JSONResponse({"ready": True})
-        response.set_cookie(
-            SESSION_COOKIE,
-            token,
-            max_age=SESSION_MAX_AGE,
-            httponly=True,
-            secure=settings.secure_session_cookie,
-            samesite="strict",
-            path="/api",
+        response = JSONResponse(
+            {
+                "ready": True,
+                "authenticated": False,
+                "login": None,
+                "oauth_configured": settings.github_oauth_configured,
+            }
         )
+        _set_session_cookie(response, token)
         return response
-    return {"ready": True}
+    return {
+        "ready": True,
+        "authenticated": bool(claims.get("user_id")),
+        "login": claims.get("login"),
+        "oauth_configured": settings.github_oauth_configured,
+    }
+
+
+@app.get("/api/auth/github")
+async def begin_github_login():
+    if not settings.github_oauth_configured:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "github_oauth_not_configured",
+                "message": "GitHub sign-in is not configured on this API yet.",
+            },
+        )
+    state, state_cookie = create_oauth_state(session_secret)
+    response = RedirectResponse(
+        "https://github.com/login/oauth/authorize?"
+        + urlencode(
+            {
+                "client_id": settings.github_client_id,
+                "redirect_uri": settings.github_oauth_callback_url,
+                "scope": "read:user",
+                "state": state,
+            }
+        ),
+        status_code=302,
+    )
+    response.set_cookie(
+        OAUTH_STATE_COOKIE,
+        state_cookie,
+        max_age=600,
+        httponly=True,
+        secure=settings.secure_session_cookie,
+        samesite="lax",
+        path="/api/auth/github/callback",
+    )
+    return response
+
+
+@app.get("/api/auth/github/callback")
+async def finish_github_login(request: Request, code: str = "", state: str = ""):
+    if not settings.github_oauth_configured:
+        return RedirectResponse(
+            settings.frontend_url + "?auth=unavailable", status_code=303
+        )
+    state_cookie = request.cookies.get(OAUTH_STATE_COOKIE)
+    if not verify_oauth_state(state_cookie, state, session_secret) or not code:
+        response = RedirectResponse(
+            settings.frontend_url + "?auth=failed", status_code=303
+        )
+        response.delete_cookie(OAUTH_STATE_COOKIE, path="/api/auth/github/callback")
+        return response
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0), follow_redirects=False
+        ) as client:
+            token_response = await client.post(
+                "https://github.com/login/oauth/access_token",
+                headers={"Accept": "application/json"},
+                data={
+                    "client_id": settings.github_client_id,
+                    "client_secret": settings.github_client_secret,
+                    "code": code,
+                    "redirect_uri": settings.github_oauth_callback_url,
+                    "state": state,
+                },
+            )
+            token_response.raise_for_status()
+            access_token = token_response.json().get("access_token")
+            if not isinstance(access_token, str) or not access_token:
+                raise ValueError("GitHub did not return an access token")
+            user_response = await client.get(
+                "https://api.github.com/user",
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {access_token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            user_response.raise_for_status()
+            github_user = user_response.json()
+        github_id = github_user.get("id")
+        login = github_user.get("login")
+        if not isinstance(github_id, int) or not isinstance(login, str) or not login:
+            raise ValueError("GitHub returned an invalid account profile")
+    except (httpx.HTTPError, ValueError, KeyError):
+        logger.warning("GitHub OAuth sign-in failed")
+        response = RedirectResponse(
+            settings.frontend_url + "?auth=failed", status_code=303
+        )
+        response.delete_cookie(OAUTH_STATE_COOKIE, path="/api/auth/github/callback")
+        return response
+    finally:
+        access_token = None
+    existing_claims = session_claims(
+        request.cookies.get(SESSION_COOKIE), session_secret
+    )
+    workspace_id = str(existing_claims["workspace_id"]) if existing_claims else None
+    if workspace_id and _workspace_closed(request, workspace_id):
+        workspace_id = None
+    _workspace_id, session_token = create_session(
+        session_secret, str(github_id), login, workspace_id
+    )
+    response = RedirectResponse(
+        settings.frontend_url + "?auth=success", status_code=303
+    )
+    _set_session_cookie(response, session_token)
+    response.delete_cookie(OAUTH_STATE_COOKIE, path="/api/auth/github/callback")
+    return response
+
+
+@app.post("/api/auth/logout", status_code=204)
+async def logout(request: Request) -> Response:
+    workspace_id = _owner_key(request)
+    request.app.state.closed_workspaces[workspace_id] = time.monotonic() + 21_600
+    lock = request.app.state.workspace_locks.setdefault(workspace_id, asyncio.Lock())
+    async with lock:
+        if (driver := request.app.state.driver) is not None:
+            await delete_workspace_repositories(
+                driver, settings.neo4j_database, workspace_id
+            )
+    _workspace_id, token = create_session(session_secret)
+    response = Response(status_code=204)
+    _set_session_cookie(response, token)
+    return response
 
 
 @app.post("/api/session/cleanup", status_code=204)
@@ -397,15 +597,7 @@ async def cleanup_browser_workspace(request: Request) -> Response:
                 ) from error
     _new_workspace_id, token = create_session(session_secret)
     response = Response(status_code=204)
-    response.set_cookie(
-        SESSION_COOKIE,
-        token,
-        max_age=SESSION_MAX_AGE,
-        httponly=True,
-        secure=settings.secure_session_cookie,
-        samesite="strict",
-        path="/api",
-    )
+    _set_session_cookie(response, token)
     return response
 
 
@@ -434,6 +626,30 @@ async def analyze_repository(
         ) from error
 
     owner, repository = parse_repository_url(str(payload.repository_url))
+    user_id = _authenticated_user_id(request)
+    if user_id:
+        try:
+            if await find_saved_repository_id(
+                driver,
+                settings.neo4j_database,
+                user_id,
+                f"{owner}/{repository}",
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "repository_already_saved",
+                        "message": "This repository is already saved to your account. Open it from your repository list instead of creating a duplicate index.",
+                    },
+                )
+        except (DriverError, Neo4jError, ExceptionGroup) as error:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "repository_lookup_failed",
+                    "message": "Your saved repository list could not be checked.",
+                },
+            ) from error
     client_key = _owner_key(request)
     now = time.monotonic()
     limit = request.app.state.import_limits[client_key]
@@ -502,7 +718,10 @@ async def list_repositories(request: Request) -> list[RepositorySummary]:
     driver = _driver(request)
     try:
         repositories = await list_workspace_repositories(
-            driver, settings.neo4j_database, _owner_key(request)
+            driver,
+            settings.neo4j_database,
+            _owner_key(request),
+            _authenticated_user_id(request),
         )
     except (DriverError, Neo4jError, ExceptionGroup) as error:
         logger.exception("Neo4j repository list query failed")
@@ -531,13 +750,28 @@ async def get_repository_graph(
     parsed_owner, parsed_repo = parse_repository_url(
         f"https://github.com/{owner}/{repository}"
     )
-    repository_id = (
-        f"{_owner_key(request)}:github.com/{parsed_owner.lower()}/{parsed_repo.lower()}"
-    )
     driver = _driver(request)
     try:
+        repository_id = await find_accessible_repository_id(
+            driver,
+            settings.neo4j_database,
+            _owner_key(request),
+            _authenticated_user_id(request),
+            f"{parsed_owner}/{parsed_repo}",
+        )
+        if repository_id is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "repository_not_indexed",
+                    "message": "Repository index not found.",
+                },
+            )
         exists = await touch_repository_graph(
-            driver, settings.neo4j_database, repository_id
+            driver,
+            settings.neo4j_database,
+            repository_id,
+            _authenticated_user_id(request),
         )
     except (DriverError, Neo4jError, ExceptionGroup) as error:
         raise HTTPException(
@@ -589,18 +823,33 @@ async def get_repository_file(
     parsed_owner, parsed_repo = parse_repository_url(
         f"https://github.com/{owner}/{repository}"
     )
-    repository_id = (
-        f"{_owner_key(request)}:github.com/{parsed_owner.lower()}/{parsed_repo.lower()}"
-    )
     driver = _driver(request)
     try:
+        repository_id = await find_accessible_repository_id(
+            driver,
+            settings.neo4j_database,
+            _owner_key(request),
+            _authenticated_user_id(request),
+            f"{parsed_owner}/{parsed_repo}",
+        )
+        if repository_id is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "repository_not_indexed",
+                    "message": "Repository index not found.",
+                },
+            )
         rows, _, _ = await driver.execute_query(
-            "MATCH (r:Repository {id: $id}) WHERE r.expires_at > $now "
-            "SET r.expires_at = $expires_at "
+            "MATCH (r:Repository {id: $id}) WHERE r.expires_at > $now OR "
+            "(r.is_saved = true AND $user_id IS NOT NULL AND r.owner_user_id = $user_id) "
+            "WITH r, CASE WHEN r.is_saved = true THEN null ELSE $expires_at END AS expiry "
+            "SET r.expires_at = expiry "
             "RETURN r.default_branch AS branch LIMIT 1",
             id=repository_id,
             now=datetime.now(UTC).isoformat(),
             expires_at=(datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+            user_id=_authenticated_user_id(request),
             database_=settings.neo4j_database,
         )
     except (DriverError, Neo4jError, ExceptionGroup) as error:
@@ -639,12 +888,19 @@ async def delete_repository(owner: str, repository: str, request: Request) -> No
     parsed_owner, parsed_repo = parse_repository_url(
         f"https://github.com/{owner}/{repository}"
     )
-    repository_id = (
-        f"{_owner_key(request)}:github.com/{parsed_owner.lower()}/{parsed_repo.lower()}"
-    )
     driver = _driver(request)
     try:
-        await delete_repository_graph(driver, settings.neo4j_database, repository_id)
+        repository_id = await find_accessible_repository_id(
+            driver,
+            settings.neo4j_database,
+            _owner_key(request),
+            _authenticated_user_id(request),
+            f"{parsed_owner}/{parsed_repo}",
+        )
+        if repository_id:
+            await delete_repository_graph(
+                driver, settings.neo4j_database, repository_id
+            )
     except (DriverError, Neo4jError, ExceptionGroup) as error:
         raise HTTPException(
             status_code=503,
@@ -653,3 +909,70 @@ async def delete_repository(owner: str, repository: str, request: Request) -> No
                 "message": "The repository graph could not be removed.",
             },
         ) from error
+
+
+@app.post("/api/repositories/{owner}/{repository}/save")
+async def save_repository(
+    owner: str, repository: str, request: Request
+) -> dict[str, bool]:
+    user_id = _authenticated_user_id(request)
+    if not user_id:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "authentication_required",
+                "message": "Sign in with GitHub before saving repository indexes.",
+            },
+        )
+    parsed_owner, parsed_repo = parse_repository_url(
+        f"https://github.com/{owner}/{repository}"
+    )
+    driver = _driver(request)
+    try:
+        repository_id = await find_accessible_repository_id(
+            driver,
+            settings.neo4j_database,
+            _owner_key(request),
+            user_id,
+            f"{parsed_owner}/{parsed_repo}",
+        )
+        if repository_id is None or not repository_id.startswith(
+            f"{_owner_key(request)}:"
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "temporary_index_not_found",
+                    "message": "Only an index in your current workspace can be saved.",
+                },
+            )
+        saved = await save_repository_graph(
+            driver,
+            settings.neo4j_database,
+            repository_id,
+            _owner_key(request),
+            user_id,
+        )
+        if not saved:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "temporary_index_expired",
+                    "message": "This temporary index expired before it could be saved.",
+                },
+            )
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
+        logger.exception("Neo4j repository save failed")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "repository_save_failed",
+                "message": "The repository index could not be saved.",
+            },
+        ) from error
+    return {"saved": True}
+
+
+frontend_dist = Path(__file__).resolve().parents[2] / "dist"
+if frontend_dist.is_dir():
+    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")

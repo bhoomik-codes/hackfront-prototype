@@ -60,3 +60,4 @@ class RepositorySummary(BaseModel):
     description: str | None = None
     default_branch: str
     indexed_at: str
+    is_saved: bool = False

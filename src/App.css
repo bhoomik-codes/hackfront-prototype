@@ -107,6 +107,9 @@ a { color: inherit; text-decoration: none; }
 .topbar-icon:hover { border-color: var(--line); color: #d5d9cf; }
 .topbar-new { display: flex; align-items: center; gap: 7px; padding: 7px 10px; border: 1px solid #343a30; border-radius: 4px; background: #20241d; color: #d0d5c8; font-size: 10px; }
 .topbar-new:hover { border-color: #5e6b49; }
+.topbar-save, .topbar-account { display: flex; align-items: center; justify-content: center; padding: 7px 10px; border: 1px solid #4a5737; border-radius: 4px; background: #272f20; color: #d2f06c; font-size: 10px; white-space: nowrap; }
+.topbar-save:hover, .topbar-account:hover { border-color: #93a965; }
+.topbar-save:disabled { opacity: .55; cursor: not-allowed; }
 .workspace-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 52px minmax(400px, 1fr) 342px; }
 .left-rail { display: flex; align-items: center; flex-direction: column; gap: 9px; padding: 15px 0; border-right: 1px solid var(--line); background: #151713; }
 .rail-item { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 5px; background: transparent; color: #82897e; }
@@ -339,6 +342,7 @@ a { color: inherit; text-decoration: none; }
   .sample-tag { font-size: 7px; padding: 2px 4px; }
   .topbar-new { gap: 4px; padding: 6px 7px; font-size: 9px; }
   .topbar-new svg { width: 13px; }
+  .topbar-save, .topbar-account { padding: 6px 7px; font-size: 9px; }
   .workspace-body { grid-template-columns: 38px minmax(0,1fr); }
   .graph-area { padding: 15px 10px 10px; }
   .workspace-heading h2 { font-size: 16px; }

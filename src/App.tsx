@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Core, ElementDefinition } from 'cytoscape'
 import type { GraphMode, RepositoryGraphData, RepositoryGraphNode, RepositorySource, RepositorySummary } from './types'
-import { checkApiHealth, deleteRepository, getAnalysisJob, getRepositories, getRepositoryFile, getRepositoryGraph, RepositoryApiError, startBrowserSession, startRepositoryAnalysis } from './services/repositoryApi'
+import { checkApiHealth, deleteRepository, getAnalysisJob, getRepositories, getRepositoryFile, getRepositoryGraph, loginWithGitHub, logout, RepositoryApiError, saveRepository, startBrowserSession, startRepositoryAnalysis } from './services/repositoryApi'
 import { askWithEvidence, type AssistantSettings, type EvidenceCitation } from './services/evidenceAssistant'
 import {
   ArrowDown, ArrowRight, ArrowsOut, BookOpenText,
@@ -194,6 +194,9 @@ function App() {
   const [apiHealth, setApiHealth] = useState<{ ready: boolean; message: string } | null>(null)
   const [activeRepository, setActiveRepository] = useState<{ owner: string; repository: string; fullName: string; branch?: string } | null>(null)
   const [savedRepositories, setSavedRepositories] = useState<RepositorySummary[]>([])
+  const [githubLogin, setGithubLogin] = useState<string | null>(null)
+  const [oauthConfigured, setOauthConfigured] = useState(false)
+  const [activeIsSaved, setActiveIsSaved] = useState(false)
   const [liveGraph, setLiveGraph] = useState<RepositoryGraphData | null>(null)
   const [graphLoading, setGraphLoading] = useState(false)
   const [currentSource, setCurrentSource] = useState<RepositorySource | null>(null)
@@ -205,7 +208,12 @@ function App() {
   const [shareWithProvider, setShareWithProvider] = useState(false)
   const [assistantBusy, setAssistantBusy] = useState(false)
   const [activeSource, setActiveSource] = useState('code')
-  const [notice, setNotice] = useState('')
+  const [notice, setNotice] = useState(() => {
+    const authResult = new URLSearchParams(window.location.search).get('auth')
+    if (authResult === 'unavailable') return 'GitHub sign-in is not configured on the API yet.'
+    if (authResult && authResult !== 'success') return 'GitHub sign-in did not complete. Please try again.'
+    return ''
+  })
   const nodes = toDisplayNodes(mode, liveGraph)
   const selected = nodes.find((node) => node.id === selectedId) ?? nodes[0]
   const connectedNodes = liveGraph && selected
@@ -232,7 +240,11 @@ function App() {
 
   useEffect(() => {
     let active = true
-    void startBrowserSession().then(async () => {
+    void startBrowserSession().then(async (session) => {
+      if (active) {
+        setGithubLogin(session.authenticated ? session.login ?? 'GitHub user' : null)
+        setOauthConfigured(Boolean(session.oauth_configured))
+      }
       const health = await checkApiHealth()
       if (active) setApiHealth({ ready: health.status === 'ready' && health.neo4j_configured, message: health.message ?? '' })
       try {
@@ -246,7 +258,25 @@ function App() {
   }, [])
 
   useEffect(() => {
+    const authResult = new URLSearchParams(window.location.search).get('auth')
+    if (!authResult) return
+    if (authResult === 'success') {
+      void startBrowserSession().then((session) => {
+        setGithubLogin(session.authenticated ? session.login ?? 'GitHub user' : null)
+        setNotice(session.authenticated ? `Signed in as ${session.login}. You can now choose which indexes to save.` : 'Sign-in could not be verified. Please try again.')
+      })
+    }
+    window.history.replaceState({}, '', window.location.pathname)
+  }, [])
+
+  useEffect(() => {
     const cleanupTemporaryWorkspace = () => {
+      try {
+        if (sessionStorage.getItem('why-oauth-redirect') === 'true') {
+          sessionStorage.removeItem('why-oauth-redirect')
+          return
+        }
+      } catch { /* best-effort session storage */ }
       const payload = new Blob([], { type: 'text/plain' })
       if (!navigator.sendBeacon('/api/session/cleanup', payload)) {
         void fetch('/api/session/cleanup', {
@@ -317,6 +347,7 @@ function App() {
       const [owner, repository] = completedJob.repository.split('/')
       if (!owner || !repository) throw new RepositoryApiError('GitHub returned an invalid repository name.', 'invalid_repository', 502)
       setActiveRepository({ owner, repository, fullName: completedJob.repository })
+      setActiveIsSaved(false)
       void getRepositories().then(setSavedRepositories).catch(() => { /* graph load still works if the list refresh fails */ })
       setChat([{ role: 'assistant', text: 'Ask about this codebase. I’ll use connected commits, discussions, and source files, cite indexed records, and say when the available history cannot support an answer.' }])
       setShareWithProvider(false)
@@ -337,6 +368,7 @@ function App() {
 
   const handleDemo = () => {
     setActiveRepository(null)
+    setActiveIsSaved(false)
     setLiveGraph(null)
     setGraphLoading(false)
     setCurrentSource(null)
@@ -351,7 +383,7 @@ function App() {
 
   const leaveCurrentRepository = () => {
     const leaving = activeRepository
-    if (leaving) {
+    if (leaving && !activeIsSaved) {
       void deleteRepository(leaving.owner, leaving.repository)
         .then(() => setSavedRepositories((repositories) => repositories.filter((repository) => repository.full_name !== leaving.fullName)))
         .catch(() => setNotice('This temporary graph could not be deleted immediately. Automatic cleanup will remove it within two hours.'))
@@ -366,6 +398,7 @@ function App() {
 
   const openSavedRepository = (repository: RepositorySummary) => {
     setActiveRepository({ owner: repository.owner, repository: repository.repository, fullName: repository.full_name, branch: repository.default_branch })
+    setActiveIsSaved(repository.is_saved)
     setLiveGraph({ repository: {}, nodes: [], edges: [], coverage: {} })
     setGraphLoading(true)
     setCurrentSource(null)
@@ -375,6 +408,35 @@ function App() {
     setChat([{ role: 'assistant', text: 'Ask about this codebase. I’ll use connected commits, discussions, and source files, cite indexed records, and say when the available history cannot support an answer.' }])
     setShareWithProvider(false)
     setWorkspace(true)
+  }
+
+  const handleSaveIndex = async () => {
+    if (!activeRepository) return
+    if (!githubLogin) { loginWithGitHub(); return }
+    try {
+      await saveRepository(activeRepository.owner, activeRepository.repository)
+      setActiveIsSaved(true)
+      setSavedRepositories(await getRepositories())
+      setNotice(`${activeRepository.fullName} is saved to your GitHub account.`)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'This index could not be saved.')
+    }
+  }
+
+  const handleLogout = async () => {
+    try {
+      await logout()
+      setGithubLogin(null)
+      setActiveIsSaved(false)
+      setSavedRepositories([])
+      setWorkspace(false)
+      setActiveRepository(null)
+      setLiveGraph(null)
+      setCurrentSource(null)
+      setNotice('Signed out. Your saved indexes remain private to your account.')
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Sign-out failed.')
+    }
   }
 
   const submitQuestion = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -448,7 +510,7 @@ function App() {
       {!workspace ? <section className="landing">
         <header className="landing-nav">
           <a className="brand" href="#top" aria-label="Why home"><span className="brand-mark"><Graph size={17} weight="bold" /></span><span>why<span className="brand-period">.</span></span></a>
-          <div className="nav-right"><span className="nav-status"><span className={`status-dot ${apiHealth?.ready ? '' : 'muted-dot'}`} /> {apiHealth?.ready ? 'Neo4j graph ready' : 'Evidence-first analysis'}</span><button className="nav-link" onClick={handleDemo}>Explore sample <ArrowRight size={15} /></button></div>
+          <div className="nav-right"><span className="nav-status"><span className={`status-dot ${apiHealth?.ready ? '' : 'muted-dot'}`} /> {apiHealth?.ready ? 'Neo4j graph ready' : 'Evidence-first analysis'}</span>{githubLogin ? <button className="nav-link" onClick={() => void handleLogout()}>@{githubLogin} · Sign out</button> : <button className="nav-link" disabled={!oauthConfigured} onClick={loginWithGitHub}>{oauthConfigured ? 'Sign in with GitHub' : 'GitHub sign-in unavailable'}</button>}<button className="nav-link" onClick={handleDemo}>Explore sample <ArrowRight size={15} /></button></div>
         </header>
         <div className="landing-grid" id="top">
           <section className="hero-copy">
@@ -460,11 +522,11 @@ function App() {
               <input aria-label="Public GitHub repository URL" value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} placeholder="github.com/owner/repository" />
               <button type="submit" disabled={isIndexing}>{isIndexing ? `Indexing ${indexProgress.progress}%` : <>Analyze repo <ArrowRight size={16} /></>}</button>
             </form>
-            <label className="storage-consent"><input type="checkbox" checked={storageConsent} onChange={(event) => setStorageConsent(event.target.checked)} /><span>I agree that this app reads a bounded subset of public files and GitHub history, then temporarily stores file paths, relationships, and history records in its configured Neo4j database. Source file contents are not stored there. Temporary graph data is deleted when I leave or after two hours of inactivity.</span></label>
-            <div className="form-caption"><ShieldCheck size={15} /> Read-only · No code execution · All indexes are temporary; account-based saving is not enabled yet</div>
+            <label className="storage-consent"><input type="checkbox" checked={storageConsent} onChange={(event) => setStorageConsent(event.target.checked)} /><span>I agree that this app reads a bounded subset of public files and GitHub history, then temporarily stores file paths, relationships, and history records in its configured Neo4j database. Source file contents are not stored there. You can explicitly save an index to your GitHub account; otherwise it is deleted when you leave or after two hours of inactivity.</span></label>
+            <div className="form-caption"><ShieldCheck size={15} /> Read-only · No code execution · Saving requires GitHub sign-in and your explicit action</div>
             {isIndexing && <div className="index-progress" role="status"><div className="progress-track"><span style={{ width: `${indexProgress.progress}%` }} /></div><span>{indexProgress.message}</span></div>}
             <button className="folder-entry" onClick={() => setNotice('Folder import will be available in the native app. The web version analyzes public GitHub repositories.')}> <FolderSimple size={17} /> Working with a local clone? <span>Import folder in the desktop app <ArrowRight size={14} /></span></button>
-            {savedRepositories.length > 0 && <section className="saved-repositories" aria-label="Temporary repository indexes"><div className="saved-repositories-head"><b>TEMPORARY REPOSITORY INDEXES</b><span>REMOVED WHEN YOU LEAVE</span></div>{savedRepositories.slice(0, 8).map((repository) => <button className="saved-repository" key={repository.full_name} onClick={() => openSavedRepository(repository)}><span className="saved-repository-icon"><GithubLogo size={14} weight="fill" /></span><span><b>{repository.full_name}</b><small>{repository.description || `Indexed ${new Date(repository.indexed_at).toLocaleDateString()} · ${repository.default_branch}`}</small></span><ArrowRight size={14} /></button>)}</section>}
+            {savedRepositories.length > 0 && <section className="saved-repositories" aria-label="Saved and temporary repository indexes"><div className="saved-repositories-head"><b>YOUR REPOSITORY INDEXES</b><span>SAVED: {savedRepositories.filter((item) => item.is_saved).length} · TEMPORARY: {savedRepositories.filter((item) => !item.is_saved).length}</span></div>{savedRepositories.slice(0, 8).map((repository) => <button className="saved-repository" key={repository.full_name} onClick={() => openSavedRepository(repository)}><span className="saved-repository-icon"><GithubLogo size={14} weight="fill" /></span><span><b>{repository.full_name}</b><small>{repository.is_saved ? 'Saved to your GitHub account' : 'Temporary · expires after inactivity'} · {repository.default_branch}</small></span><ArrowRight size={14} /></button>)}</section>}
             {notice && !workspace && <p className="notice" role="status">{notice}</p>}
             <div className="hero-proof"><div className="proof-avatars"><span>G</span><span>↗</span><span>∷</span></div><span>For the code we inherit<br /><strong>and the context we lose.</strong></span></div>
           </section>
@@ -499,7 +561,7 @@ function App() {
         <header className="workspace-topbar">
           <a className="brand" href="#top" onClick={(event) => { event.preventDefault(); leaveCurrentRepository() }}><span className="brand-mark"><Graph size={16} weight="bold" /></span><span>why<span className="brand-period">.</span></span></a>
           <div className="repo-crumb"><span className="crumb-slash">/</span><GithubLogo size={15} weight="fill" /><b>{activeRepository?.fullName ?? 'vercel / next.js'}</b><span className="sample-tag">{activeRepository ? 'INDEXED' : 'SAMPLE'}</span><CaretDown size={13} /></div>
-          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? 'Temporary index' : 'Preview data only'}</span>{activeRepository && <button className="topbar-icon" aria-label="Remove temporary repository index" title="Remove temporary graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={leaveCurrentRepository}><Plus size={16} /> New repo</button></div>
+          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? activeIsSaved ? 'Saved index' : 'Temporary index' : 'Preview data only'}</span>{activeRepository && !activeIsSaved && <button className="topbar-save" disabled={!githubLogin && !oauthConfigured} onClick={() => void handleSaveIndex()}>{githubLogin ? 'Save index' : 'Sign in to save'}</button>}{githubLogin && <button className="topbar-account" onClick={() => void handleLogout()}>@{githubLogin}</button>}{activeRepository && <button className="topbar-icon" aria-label="Remove repository index" title="Remove repository graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={leaveCurrentRepository}><Plus size={16} /> New repo</button></div>
         </header>
         <div className="workspace-body">
           <aside className="left-rail">
@@ -524,7 +586,7 @@ function App() {
               <button className="graph-expand" aria-label="Fit graph" onClick={() => { const instance = document.querySelector('.graph-canvas'); instance?.dispatchEvent(new Event('fitgraph')) }}><ArrowsOut size={16} /></button>
               <div className="graph-zoom"><button onClick={() => document.querySelector('.graph-canvas')?.dispatchEvent(new Event('zoom-in'))}>+</button><span>100%</span><button onClick={() => document.querySelector('.graph-canvas')?.dispatchEvent(new Event('zoom-out'))}>−</button></div>
             </div>
-            <div className="graph-footnote"><span><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? `Temporary index · ${activeRepository.fullName} · deleted on exit or after inactivity` : 'Illustrative sample · repository data not yet indexed'}</span><span>DRAG TO PAN <i /> SCROLL TO ZOOM</span></div>
+            <div className="graph-footnote"><span><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? activeIsSaved ? `Saved index · ${activeRepository.fullName} · private to your GitHub account` : `Temporary index · ${activeRepository.fullName} · deleted on exit or after inactivity` : 'Illustrative sample · repository data not yet indexed'}</span><span>DRAG TO PAN <i /> SCROLL TO ZOOM</span></div>
           </section>
           <aside className="inspector">
             <div className="inspector-tabs"><button className={activeSource === 'code' ? 'active' : ''} onClick={() => setActiveSource('code')}>Explore</button><button className={activeSource === 'assistant' ? 'active' : ''} onClick={() => setActiveSource('assistant')}>Assistant <Sparkle size={13} /></button><button className="inspector-close" aria-label="Close panel"><X size={16} /></button></div>
