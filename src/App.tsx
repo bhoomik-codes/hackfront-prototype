@@ -640,7 +640,7 @@ function App() {
     <main className="app-shell">
       {!workspace ? <section className="landing">
         <header className="landing-nav">
-          <a className="brand" href="#top" aria-label="Why home"><span className="brand-mark"><Graph size={17} weight="bold" /></span><span>why<span className="brand-period">.</span></span></a>
+          <a className="brand" href="#top" aria-label="Why the Code home"><img className="brand-symbol" src="/brand-mark.svg" alt="" /><span>why<span className="brand-period">.</span></span></a>
           <div className="nav-right"><span className="nav-status"><span className={`status-dot ${apiHealth?.ready ? '' : 'muted-dot'}`} /> {apiHealth?.ready ? 'Neo4j graph ready' : 'Evidence-first analysis'}</span>{githubLogin ? <button className="nav-link" onClick={() => void openAccountSettings()}>@{githubLogin} · Account</button> : <button className="nav-link" onClick={openAuthDialog}>Sign in</button>}<button className="nav-link" onClick={handleDemo}>Explore sample <ArrowRight size={15} /></button></div>
         </header>
         <div className="landing-grid" id="top">
@@ -690,7 +690,7 @@ function App() {
         <footer className="landing-footer"><span>WHY THE CODE IS LIKE THIS</span><span>BUILDING CONTEXT THAT STAYS</span></footer>
       </section> : <section className="workspace">
         <header className="workspace-topbar">
-          <a className="brand" href="#top" onClick={(event) => { event.preventDefault(); leaveCurrentRepository() }}><span className="brand-mark"><Graph size={16} weight="bold" /></span><span>why<span className="brand-period">.</span></span></a>
+          <a className="brand" href="#top" onClick={(event) => { event.preventDefault(); leaveCurrentRepository() }} aria-label="Why the Code home"><img className="brand-symbol" src="/brand-mark.svg" alt="" /><span>why<span className="brand-period">.</span></span></a>
           <div className="repo-crumb"><span className="crumb-slash">/</span><GithubLogo size={15} weight="fill" /><b>{activeRepository?.fullName ?? 'vercel / next.js'}</b><span className="sample-tag">{activeRepository ? 'INDEXED' : 'SAMPLE'}</span><CaretDown size={13} /></div>
           <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? activeIsSaved ? 'Saved index' : 'Temporary index' : 'Preview data only'}</span>{activeRepository && !activeIsSaved && <button className="topbar-save" onClick={() => void handleSaveIndex()}>{githubLogin ? 'Save index' : 'Sign in to save'}</button>}{githubLogin && <button className="topbar-account" onClick={() => void openAccountSettings()} title="Account settings">@{githubLogin}</button>}{activeRepository && <button className="topbar-icon" aria-label="Remove repository index" title="Remove repository graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={leaveCurrentRepository}><Plus size={16} /> New repo</button></div>
         </header>
