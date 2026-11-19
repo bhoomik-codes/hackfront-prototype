@@ -167,6 +167,7 @@ async def secure_api_response(request: Request, call_next):
         requests.append(now)
         if request.method == "OPTIONS" or request.url.path in {
             "/api/session",
+            "/api/health",
             "/api/auth/github",
             "/api/auth/github/callback",
         }:
