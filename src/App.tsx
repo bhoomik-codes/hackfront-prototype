@@ -2,9 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Core, ElementDefinition } from 'cytoscape'
 import type { GraphMode, RepositoryGraphData, RepositoryGraphNode, RepositorySource } from './types'
 import { checkApiHealth, deleteRepository, getAnalysisJob, getRepositoryFile, getRepositoryGraph, RepositoryApiError, startBrowserSession, startRepositoryAnalysis } from './services/repositoryApi'
+import { askWithEvidence, type AssistantSettings, type EvidenceCitation } from './services/evidenceAssistant'
 import {
   ArrowDown, ArrowRight, ArrowsOut, BookOpenText,
-  CheckCircle, CaretDown, ClockCounterClockwise, Code, FileCode,
+  CheckCircle, CaretDown, ClockCounterClockwise, Code, FileCode, GearSix,
   FolderSimple, GithubLogo, GitCommit, GitPullRequest, Graph,
   MagnifyingGlass, PaperPlaneRight, Plus, ShieldCheck, Sparkle, Trash, X,
 } from '@phosphor-icons/react'
@@ -12,7 +13,18 @@ import './App.css'
 
 type NodeKind = 'root' | 'repository' | 'module' | 'directory' | 'file' | 'symbol' | 'commit' | 'pr' | 'pull_request' | 'issue' | 'person' | 'decision' | 'comment' | 'review' | string
 type GraphNode = { id: string; label: string; kind: NodeKind; description: string; path?: string | null; date?: string; author?: string; content?: string; x?: number; y?: number; metadata?: Record<string, string | number | boolean | null> }
-type ChatMessage = { role: 'user' | 'assistant'; text: string; sources?: string[] }
+type ChatMessage = { role: 'user' | 'assistant'; text: string; sources?: string[]; citations?: EvidenceCitation[]; confidence?: string }
+
+function getSavedAssistantSettings(): AssistantSettings {
+  try {
+    const saved = sessionStorage.getItem('why-assistant-settings')
+    if (saved) {
+      const parsed = JSON.parse(saved) as Partial<AssistantSettings>
+      return { endpoint: typeof parsed.endpoint === 'string' ? parsed.endpoint : 'https://api.openai.com/v1', model: typeof parsed.model === 'string' ? parsed.model : '', apiKey: '' }
+    }
+  } catch { /* session storage can be disabled by browser policy */ }
+  return { endpoint: 'https://api.openai.com/v1', model: '', apiKey: '' }
+}
 
 const architectureNodes: GraphNode[] = [
   { id: 'repo', label: 'vercel / next.js', kind: 'root', description: 'Repository overview · illustrative preview', x: 500, y: 320 },
@@ -175,6 +187,10 @@ function App() {
   const [sourceError, setSourceError] = useState('')
   const [chat, setChat] = useState<ChatMessage[]>([{ role: 'assistant', text: 'Ask about this codebase. I’ll trace the answer back to repository evidence and call out when the history can’t support a conclusion.' }])
   const [question, setQuestion] = useState('')
+  const [assistantSettings, setAssistantSettings] = useState<AssistantSettings>(getSavedAssistantSettings)
+  const [showAssistantSettings, setShowAssistantSettings] = useState(false)
+  const [shareWithProvider, setShareWithProvider] = useState(false)
+  const [assistantBusy, setAssistantBusy] = useState(false)
   const [activeSource, setActiveSource] = useState('code')
   const [notice, setNotice] = useState('')
   const nodes = toDisplayNodes(mode, liveGraph)
@@ -200,6 +216,10 @@ function App() {
     })
     return () => { active = false }
   }, [])
+
+  useEffect(() => {
+    try { sessionStorage.setItem('why-assistant-settings', JSON.stringify({ endpoint: assistantSettings.endpoint, model: assistantSettings.model })) } catch { /* keep settings in memory if storage is unavailable */ }
+  }, [assistantSettings])
 
   useEffect(() => {
     if (!activeRepository) return
@@ -255,6 +275,8 @@ function App() {
       const [owner, repository] = completedJob.repository.split('/')
       if (!owner || !repository) throw new RepositoryApiError('GitHub returned an invalid repository name.', 'invalid_repository', 502)
       setActiveRepository({ owner, repository, fullName: completedJob.repository })
+      setChat([{ role: 'assistant', text: 'Ask about this codebase. I’ll use connected commits, discussions, and source files, cite indexed records, and say when the available history cannot support an answer.' }])
+      setShareWithProvider(false)
       setLiveGraph({ repository: {}, nodes: [], edges: [], coverage: {} })
       setGraphLoading(true)
       setCurrentSource(null)
@@ -277,18 +299,31 @@ function App() {
     setCurrentSource(null)
     setSourceError('')
     setMode('architecture')
+    setShareWithProvider(false)
+    setChat([{ role: 'assistant', text: 'This is an illustrative sample workspace. Ask a question to see how the evidence flow will look.' }])
     setSelectedId('routefn')
     setWorkspace(true)
     setNotice('You are viewing an illustrative sample workspace. No repository data has been fetched yet.')
   }
 
-  const submitQuestion = (event: React.FormEvent<HTMLFormElement>) => {
+  const submitQuestion = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const text = question.trim()
-    if (!text) return
+    if (!text || assistantBusy) return
     if (activeRepository) {
-      setNotice('Live repository answers are not enabled yet. The indexed graph and source files are available to explore.')
+      if (!shareWithProvider) { setNotice('Confirm before sending repository evidence to your selected model provider.'); return }
+      if (!activeRepository || !selected) return
       setQuestion('')
+      setChat((current) => [...current, { role: 'user', text }])
+      setAssistantBusy(true)
+      try {
+        const evidenceGraph = await getRepositoryGraph(activeRepository.owner, activeRepository.repository, 'decisions')
+        const relevantSource = currentSource?.path === selected.path ? currentSource : null
+        const answer = await askWithEvidence(assistantSettings, text, evidenceGraph, selected.id, relevantSource)
+        setChat((current) => [...current, { role: 'assistant', text: answer.answer, citations: answer.citations, confidence: answer.confidence }])
+      } catch (error) {
+        setChat((current) => [...current, { role: 'assistant', text: error instanceof Error ? error.message : 'The assistant could not complete this request.' }])
+      } finally { setAssistantBusy(false) }
       return
     }
     setChat((current) => [...current, { role: 'user', text }, { role: 'assistant', text: 'This preview uses illustrative repository content. Once a repository is indexed, I’ll answer from linked code, commits, and discussions, with the source and date attached to each finding.', sources: ['Source citations will appear after indexing'] }])
@@ -353,8 +388,8 @@ function App() {
               <input aria-label="Public GitHub repository URL" value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} placeholder="github.com/owner/repository" />
               <button type="submit" disabled={isIndexing}>{isIndexing ? `Indexing ${indexProgress.progress}%` : <>Analyze repo <ArrowRight size={16} /></>}</button>
             </form>
-            <label className="storage-consent"><input type="checkbox" checked={storageConsent} onChange={(event) => setStorageConsent(event.target.checked)} /><span>I agree to send this public repository’s selected files and recent GitHub history to the Neo4j database configured for this app.</span></label>
-            <div className="form-caption"><ShieldCheck size={15} /> Read-only · No code execution · You can remove the stored graph later</div>
+            <label className="storage-consent"><input type="checkbox" checked={storageConsent} onChange={(event) => setStorageConsent(event.target.checked)} /><span>I agree that this app reads a bounded subset of public files and GitHub history, then stores file paths, relationships, and history records in its configured Neo4j database. Source file contents are not stored there.</span></label>
+            <div className="form-caption"><ShieldCheck size={15} /> Read-only · No code execution · Remove the stored graph at any time</div>
             {isIndexing && <div className="index-progress" role="status"><div className="progress-track"><span style={{ width: `${indexProgress.progress}%` }} /></div><span>{indexProgress.message}</span></div>}
             <button className="folder-entry" onClick={() => setNotice('Folder import will be available in the native app. The web version analyzes public GitHub repositories.')}> <FolderSimple size={17} /> Working with a local clone? <span>Import folder in the desktop app <ArrowRight size={14} /></span></button>
             {notice && !workspace && <p className="notice" role="status">{notice}</p>}
@@ -391,7 +426,7 @@ function App() {
         <header className="workspace-topbar">
           <a className="brand" href="#top" onClick={(event) => { event.preventDefault(); setWorkspace(false) }}><span className="brand-mark"><Graph size={16} weight="bold" /></span><span>why<span className="brand-period">.</span></span></a>
           <div className="repo-crumb"><span className="crumb-slash">/</span><GithubLogo size={15} weight="fill" /><b>{activeRepository?.fullName ?? 'vercel / next.js'}</b><span className="sample-tag">{activeRepository ? 'INDEXED' : 'SAMPLE'}</span><CaretDown size={13} /></div>
-          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? 'Live repository data' : 'Preview data only'}</span>{activeRepository && <button className="topbar-icon" aria-label="Remove indexed repository" title="Remove indexed graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={() => { setWorkspace(false); setActiveRepository(null); setLiveGraph(null); setCurrentSource(null); setNotice('') }}><Plus size={16} /> New repo</button></div>
+          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? 'Live repository data' : 'Preview data only'}</span>{activeRepository && <button className="topbar-icon" aria-label="Remove indexed repository" title="Remove indexed graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={() => { setWorkspace(false); setActiveRepository(null); setLiveGraph(null); setCurrentSource(null); setChat([{ role: 'assistant', text: 'Ask about this codebase. I’ll trace the answer back to repository evidence and call out when the graph can’t support a conclusion.' }]); setShareWithProvider(false); setNotice('') }}><Plus size={16} /> New repo</button></div>
         </header>
         <div className="workspace-body">
           <aside className="left-rail">
@@ -421,12 +456,14 @@ function App() {
           <aside className="inspector">
             <div className="inspector-tabs"><button className={activeSource === 'code' ? 'active' : ''} onClick={() => setActiveSource('code')}>Explore</button><button className={activeSource === 'assistant' ? 'active' : ''} onClick={() => setActiveSource('assistant')}>Assistant <Sparkle size={13} /></button><button className="inspector-close" aria-label="Close panel"><X size={16} /></button></div>
             {activeSource === 'assistant' ? <div className="assistant-panel">
-              <div className="assistant-intro"><div className="assistant-mark"><Sparkle size={17} /></div><div><b>Repository assistant</b><small>Grounded in indexed evidence</small></div><span className="offline-pill">PREVIEW</span></div>
+              <div className="assistant-intro"><div className="assistant-mark"><Sparkle size={17} /></div><div><b>Repository assistant</b><small>{activeRepository ? 'BYOK · cited repository evidence' : 'Illustrative sample mode'}</small></div><button className="assistant-settings-button" aria-label="Model settings" title="Model settings" onClick={() => setShowAssistantSettings((open) => !open)}><GearSix size={16} /></button><span className="offline-pill">{activeRepository ? 'BYOK' : 'PREVIEW'}</span></div>
+              {showAssistantSettings && <form className="assistant-settings" onSubmit={(event) => { event.preventDefault(); setShowAssistantSettings(false); setNotice('Model settings are saved for this browser tab only.') }}><div className="settings-heading"><b>Connect your model</b><button type="button" aria-label="Close model settings" onClick={() => setShowAssistantSettings(false)}><X size={14} /></button></div><label>OpenAI-compatible API URL<input value={assistantSettings.endpoint} onChange={(event) => setAssistantSettings((settings) => ({ ...settings, endpoint: event.target.value }))} placeholder="https://api.openai.com/v1" autoComplete="url" /></label><label>Model name<input value={assistantSettings.model} onChange={(event) => setAssistantSettings((settings) => ({ ...settings, model: event.target.value }))} placeholder="gpt-4o-mini" autoComplete="off" /></label><label>API key<input type="password" value={assistantSettings.apiKey} onChange={(event) => setAssistantSettings((settings) => ({ ...settings, apiKey: event.target.value }))} placeholder="Paste your provider key" autoComplete="new-password" /></label><p>Your key stays in this tab and goes directly from your browser to the provider. It is never sent to this app’s API.</p><button className="settings-save" type="submit">Save for this tab</button></form>}
               <div className="assistant-context"><span className="context-icon"><Code size={14} /></span><span>Context <b>{selected?.label ?? 'Repository'}</b></span><button aria-label="Clear context" onClick={() => setSelectedId('repo')}><X size={13} /></button></div>
-              <div className="chat-messages">{chat.map((message, index) => <div className={`chat-message ${message.role}`} key={`${message.role}-${index}`}><div className="chat-avatar">{message.role === 'assistant' ? <Sparkle size={13} /> : 'Y'}</div><div className="chat-content"><p>{message.text}</p>{message.sources?.map((source) => <div className="source-chip" key={source}><BookOpenText size={13} /> {source}</div>)}</div></div>)}</div>
+              <div className="chat-messages">{chat.map((message, index) => <div className={`chat-message ${message.role}`} key={`${message.role}-${index}`}><div className="chat-avatar">{message.role === 'assistant' ? <Sparkle size={13} /> : 'Y'}</div><div className="chat-content"><p>{message.text}</p>{message.confidence && <span className={`confidence-badge confidence-${message.confidence}`}>{message.confidence} confidence</span>}{message.sources?.map((source) => <div className="source-chip" key={source}><BookOpenText size={13} /> {source}</div>)}{message.citations?.map((citation) => { const url = citation.metadata.url; return <a className="source-chip" href={typeof url === 'string' && url.startsWith('https://github.com/') ? url : undefined} target="_blank" rel="noreferrer" key={citation.id}><BookOpenText size={13} /> {citation.kind.toUpperCase()} · {citation.label}</a> })}</div></div>)}{assistantBusy && <div className="assistant-thinking" role="status"><span className="loading-ring" /> Reviewing connected evidence…</div>}</div>
               <div className="suggested-questions"><span>TRY ASKING</span>{['Why does this file exist?', 'What changed this behavior?'].map((suggestion) => <button key={suggestion} onClick={() => setQuestion(suggestion)}>{suggestion}<ArrowRight size={13} /></button>)}</div>
-              <form className="chat-input-wrap" onSubmit={submitQuestion}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="Ask why this code exists…" rows={2} /><div className="chat-input-footer"><span><ShieldCheck size={13} /> Sources shown with every answer</span><button aria-label="Send question" disabled={!question.trim()}><PaperPlaneRight size={16} weight="fill" /></button></div></form>
-              <p className="assistant-disclaimer">Preview responses are illustrative. Connect a model after indexing to ask about a real repository.</p>
+              {activeRepository && <label className="provider-consent"><input type="checkbox" checked={shareWithProvider} onChange={(event) => setShareWithProvider(event.target.checked)} /><span>Send this question, selected code, and connected history to my model provider.</span></label>}
+              <form className="chat-input-wrap" onSubmit={submitQuestion}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} placeholder="Ask why this code exists…" rows={2} /><div className="chat-input-footer"><span><ShieldCheck size={13} /> Sources shown with every answer</span><button aria-label="Send question" disabled={!question.trim() || assistantBusy}>{assistantBusy ? <span className="button-spinner" /> : <PaperPlaneRight size={16} weight="fill" />}</button></div></form>
+              <p className="assistant-disclaimer">{activeRepository ? 'Answers use only the indexed history window and are checked against returned source IDs. Verify important conclusions against linked records.' : 'Preview responses are illustrative and do not use repository data.'}</p>
             </div> : <div className="entity-inspector">
               <div className="entity-type"><span className={`entity-mark ${selected?.kind ?? 'file'}`}>{selected?.kind === 'symbol' ? <Code size={15} /> : selected?.kind === 'commit' ? <GitCommit size={15} /> : selected?.kind === 'pr' ? <GitPullRequest size={15} /> : selected?.kind === 'issue' ? <BookOpenText size={15} /> : <FileCode size={15} />}</span><span>{selected?.kind?.toUpperCase() ?? 'FILE'}</span><span className="verified-preview"><span /> PREVIEW</span></div>
               <h3>{selected?.label ?? 'Select a graph node'}</h3>

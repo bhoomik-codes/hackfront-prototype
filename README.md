@@ -8,6 +8,8 @@ Repository intelligence that connects source code to the decisions and history b
 
 **Phase 2 — Live repository indexing and Neo4j.** The API validates public GitHub URLs, reads bounded repository/source/history data without executing code, and stores a workspace-isolated graph in Neo4j. The workspace can load live code and history graphs. It requires the user's own Neo4j Aura credentials.
 
+**Phase 3 — Evidence assistant with BYOK.** The assistant can answer questions from connected commits, pull requests, issues, discussions, and selected file content. It only accepts citation IDs present in the retrieved graph and declines answers with no verifiable citations. OpenAI-compatible providers are called directly from the browser after per-question consent. The API key stays in memory for the current tab and is not stored in browser storage or sent to this app's API. Confidence is based on the number and variety of validated citations, not the model's self-rating.
+
 ## Run locally
 
 Requirements: Node.js 20.19+ or 22.12+.
@@ -21,7 +23,9 @@ npm run dev
 
 Open the local URL printed by Vite and choose **Explore sample** to inspect the workspace.
 
-For a live analysis, paste a public GitHub repository URL. The app reads the default-branch tree, a bounded recent history window, and source files for local import mapping. It stores file paths and relationships, commit/PR/issue discussion records, and index metadata in your configured Neo4j database. Source files are fetched on demand for the in-app preview. The web service does not run repository code.
+For a live analysis, paste a public GitHub repository URL and confirm the data handling notice. The app reads the default-branch tree, a bounded recent history window, and a small source subset for import mapping. It stores file paths and relationships, commit/PR/issue metadata and discussion records in your configured Neo4j database. Source file contents are fetched from GitHub on demand for in-app preview and are not persisted in Neo4j. The web service does not run repository code.
+
+To use the assistant, open its settings, enter an OpenAI-compatible chat completions base URL, model name, and API key. The key is cleared when the tab is closed or reloaded. Each live-repository question requires explicit consent before the selected source and connected history are sent directly to the provider. Do not enter credentials into a provider URL.
 
 ## Checks
 
@@ -38,6 +42,8 @@ npm audit
 - Repository code is never executed during indexing.
 - Cloud graph storage and AI providers must be disclosed and opt-in.
 - Each browser receives an anonymous, signed, HTTP-only workspace session; repository graph reads and deletion are scoped to that session.
+- Model API keys are held in page memory only. The user must opt in before repository evidence is sent to a model provider.
+- Graph and assistant coverage is bounded and cannot guarantee a complete history or a correct interpretation of intent. Inspect linked source records before relying on conclusions.
 
 ## Indexing limits
 
