@@ -10,6 +10,8 @@ Repository intelligence that connects source code to the decisions and history b
 
 **Phase 3 — Evidence assistant with BYOK.** The assistant can answer questions from connected commits, pull requests, issues, discussions, and selected file content. It only accepts citation IDs present in the retrieved graph and declines answers with no verifiable citations. OpenAI-compatible providers are called directly from the browser after per-question consent. The API key stays in memory for the current tab and is not stored in browser storage or sent to this app's API. Confidence is based on the number and variety of validated citations, not the model's self-rating.
 
+**Phase 4 — Persistent browser workspace.** Indexed repositories can be reopened after a refresh from a list scoped to the signed browser workspace. Users can remove a repository graph from Aura from the workspace.
+
 ## Run locally
 
 Requirements: Node.js 20.19+ or 22.12+.

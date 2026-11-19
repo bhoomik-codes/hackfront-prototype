@@ -13,13 +13,19 @@ from neo4j.exceptions import Neo4jError
 
 from .config import get_settings
 from .github import GitHubError, GitHubIndexer, parse_repository_url
-from .graph import delete_repository_graph, index_repository, read_repository_graph
+from .graph import (
+    delete_repository_graph,
+    index_repository,
+    list_workspace_repositories,
+    read_repository_graph,
+)
 from .schemas import (
     AnalyzeAccepted,
     AnalyzeRequest,
     JobState,
     RepositoryFile,
     RepositoryGraph,
+    RepositorySummary,
 )
 from .sessions import SESSION_COOKIE, SESSION_MAX_AGE, create_session, verify_session
 
@@ -374,6 +380,25 @@ async def analyze_repository(
 @app.get("/api/jobs/{job_id}", response_model=JobState)
 async def get_job(job_id: str, request: Request) -> JobState:
     return _read_job(request, job_id)
+
+
+@app.get("/api/repositories", response_model=list[RepositorySummary])
+async def list_repositories(request: Request) -> list[RepositorySummary]:
+    driver = _driver(request)
+    try:
+        repositories = await list_workspace_repositories(
+            driver, settings.neo4j_database, _owner_key(request)
+        )
+    except Neo4jError as error:
+        logger.exception("Neo4j repository list query failed")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "repository_list_failed",
+                "message": "Your indexed repositories could not be loaded.",
+            },
+        ) from error
+    return [RepositorySummary(**repository) for repository in repositories]
 
 
 @app.get("/api/repositories/{owner}/{repository}/graph", response_model=RepositoryGraph)

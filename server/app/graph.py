@@ -609,3 +609,34 @@ async def delete_repository_graph(
 
     async with driver.session(database=database) as session:
         await session.execute_write(delete_snapshot)
+
+
+async def list_workspace_repositories(
+    driver: AsyncDriver, database: str, workspace_id: str
+) -> list[dict[str, str | None]]:
+    rows, _, _ = await driver.execute_query(
+        "MATCH (r:Repository) WHERE r.repository_id STARTS WITH $prefix "
+        "RETURN r.owner AS owner, r.name AS full_name, r.description AS description, "
+        "r.default_branch AS default_branch, r.indexed_at AS indexed_at "
+        "ORDER BY r.indexed_at DESC LIMIT 50",
+        prefix=f"{workspace_id}:github.com/",
+        database_=database,
+    )
+    repositories: list[dict[str, str | None]] = []
+    for row in rows:
+        full_name = str(row.get("full_name") or "")
+        owner = str(row.get("owner") or "")
+        repository = full_name.split("/", 1)[1] if "/" in full_name else ""
+        if not owner or not repository:
+            continue
+        repositories.append(
+            {
+                "owner": owner,
+                "repository": repository,
+                "full_name": full_name,
+                "description": row.get("description"),
+                "default_branch": str(row.get("default_branch") or "main"),
+                "indexed_at": str(row.get("indexed_at") or ""),
+            }
+        )
+    return repositories

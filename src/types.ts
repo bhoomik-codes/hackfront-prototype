@@ -43,6 +43,15 @@ export type RepositorySource = {
   truncated: boolean
 }
 
+export type RepositorySummary = {
+  owner: string
+  repository: string
+  full_name: string
+  description: string | null
+  default_branch: string
+  indexed_at: string
+}
+
 export type ApiHealth = {
   status: 'ready' | 'degraded'
   neo4j_configured: boolean

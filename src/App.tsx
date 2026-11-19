@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Core, ElementDefinition } from 'cytoscape'
-import type { GraphMode, RepositoryGraphData, RepositoryGraphNode, RepositorySource } from './types'
-import { checkApiHealth, deleteRepository, getAnalysisJob, getRepositoryFile, getRepositoryGraph, RepositoryApiError, startBrowserSession, startRepositoryAnalysis } from './services/repositoryApi'
+import type { GraphMode, RepositoryGraphData, RepositoryGraphNode, RepositorySource, RepositorySummary } from './types'
+import { checkApiHealth, deleteRepository, getAnalysisJob, getRepositories, getRepositoryFile, getRepositoryGraph, RepositoryApiError, startBrowserSession, startRepositoryAnalysis } from './services/repositoryApi'
 import { askWithEvidence, type AssistantSettings, type EvidenceCitation } from './services/evidenceAssistant'
 import {
   ArrowDown, ArrowRight, ArrowsOut, BookOpenText,
@@ -181,6 +181,7 @@ function App() {
   const [indexProgress, setIndexProgress] = useState({ progress: 0, message: 'Preparing repository analysis' })
   const [apiHealth, setApiHealth] = useState<{ ready: boolean; message: string } | null>(null)
   const [activeRepository, setActiveRepository] = useState<{ owner: string; repository: string; fullName: string; branch?: string } | null>(null)
+  const [savedRepositories, setSavedRepositories] = useState<RepositorySummary[]>([])
   const [liveGraph, setLiveGraph] = useState<RepositoryGraphData | null>(null)
   const [graphLoading, setGraphLoading] = useState(false)
   const [currentSource, setCurrentSource] = useState<RepositorySource | null>(null)
@@ -209,8 +210,13 @@ function App() {
 
   useEffect(() => {
     let active = true
-    void startBrowserSession().then(() => checkApiHealth()).then((health) => {
+    void startBrowserSession().then(async () => {
+      const health = await checkApiHealth()
       if (active) setApiHealth({ ready: health.status === 'ready' && health.neo4j_configured, message: health.message ?? '' })
+      try {
+        const repositories = await getRepositories()
+        if (active) setSavedRepositories(repositories)
+      } catch { /* keep the landing page usable if Aura is not configured */ }
     }).catch((error: unknown) => {
       if (active) setApiHealth({ ready: false, message: error instanceof Error ? error.message : 'The API is unavailable.' })
     })
@@ -275,6 +281,7 @@ function App() {
       const [owner, repository] = completedJob.repository.split('/')
       if (!owner || !repository) throw new RepositoryApiError('GitHub returned an invalid repository name.', 'invalid_repository', 502)
       setActiveRepository({ owner, repository, fullName: completedJob.repository })
+      void getRepositories().then(setSavedRepositories).catch(() => { /* graph load still works if the list refresh fails */ })
       setChat([{ role: 'assistant', text: 'Ask about this codebase. I’ll use connected commits, discussions, and source files, cite indexed records, and say when the available history cannot support an answer.' }])
       setShareWithProvider(false)
       setLiveGraph({ repository: {}, nodes: [], edges: [], coverage: {} })
@@ -304,6 +311,19 @@ function App() {
     setSelectedId('routefn')
     setWorkspace(true)
     setNotice('You are viewing an illustrative sample workspace. No repository data has been fetched yet.')
+  }
+
+  const openSavedRepository = (repository: RepositorySummary) => {
+    setActiveRepository({ owner: repository.owner, repository: repository.repository, fullName: repository.full_name, branch: repository.default_branch })
+    setLiveGraph({ repository: {}, nodes: [], edges: [], coverage: {} })
+    setGraphLoading(true)
+    setCurrentSource(null)
+    setSourceError('')
+    setMode('architecture')
+    setSelectedId('')
+    setChat([{ role: 'assistant', text: 'Ask about this codebase. I’ll use connected commits, discussions, and source files, cite indexed records, and say when the available history cannot support an answer.' }])
+    setShareWithProvider(false)
+    setWorkspace(true)
   }
 
   const submitQuestion = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -353,6 +373,7 @@ function App() {
     if (!activeRepository || !window.confirm(`Remove the stored graph for ${activeRepository.fullName} from Neo4j?`)) return
     try {
       await deleteRepository(activeRepository.owner, activeRepository.repository)
+      setSavedRepositories((repositories) => repositories.filter((repository) => repository.full_name !== activeRepository.fullName))
       setWorkspace(false)
       setActiveRepository(null)
       setLiveGraph(null)
@@ -392,6 +413,7 @@ function App() {
             <div className="form-caption"><ShieldCheck size={15} /> Read-only · No code execution · Remove the stored graph at any time</div>
             {isIndexing && <div className="index-progress" role="status"><div className="progress-track"><span style={{ width: `${indexProgress.progress}%` }} /></div><span>{indexProgress.message}</span></div>}
             <button className="folder-entry" onClick={() => setNotice('Folder import will be available in the native app. The web version analyzes public GitHub repositories.')}> <FolderSimple size={17} /> Working with a local clone? <span>Import folder in the desktop app <ArrowRight size={14} /></span></button>
+            {savedRepositories.length > 0 && <section className="saved-repositories" aria-label="Your indexed repositories"><div className="saved-repositories-head"><b>YOUR INDEXED REPOSITORIES</b><span>SCOPED TO THIS BROWSER WORKSPACE</span></div>{savedRepositories.slice(0, 8).map((repository) => <button className="saved-repository" key={repository.full_name} onClick={() => openSavedRepository(repository)}><span className="saved-repository-icon"><GithubLogo size={14} weight="fill" /></span><span><b>{repository.full_name}</b><small>{repository.description || `Indexed ${new Date(repository.indexed_at).toLocaleDateString()} · ${repository.default_branch}`}</small></span><ArrowRight size={14} /></button>)}</section>}
             {notice && !workspace && <p className="notice" role="status">{notice}</p>}
             <div className="hero-proof"><div className="proof-avatars"><span>G</span><span>↗</span><span>∷</span></div><span>For the code we inherit<br /><strong>and the context we lose.</strong></span></div>
           </section>

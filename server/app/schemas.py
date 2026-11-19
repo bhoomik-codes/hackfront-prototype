@@ -51,3 +51,12 @@ class RepositoryFile(BaseModel):
     language: str
     content: str
     truncated: bool = False
+
+
+class RepositorySummary(BaseModel):
+    owner: str
+    repository: str
+    full_name: str
+    description: str | None = None
+    default_branch: str
+    indexed_at: str

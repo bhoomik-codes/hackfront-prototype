@@ -1,4 +1,4 @@
-import type { AnalysisJob, ApiHealth, GraphMode, RepositoryGraphData, RepositorySource } from '../types'
+import type { AnalysisJob, ApiHealth, GraphMode, RepositoryGraphData, RepositorySource, RepositorySummary } from '../types'
 
 type ApiErrorPayload = { detail?: { message?: string; code?: string } | string }
 
@@ -51,6 +51,8 @@ export const getRepositoryFile = (owner: string, repository: string, path: strin
   const encodedPath = path.split('/').map(encodeURIComponent).join('/')
   return request<RepositorySource>(`/api/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/files/${encodedPath}`)
 }
+
+export const getRepositories = () => request<RepositorySummary[]>('/api/repositories')
 
 export const deleteRepository = (owner: string, repository: string) => request<void>(
   `/api/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}`,
