@@ -16,7 +16,7 @@ Repository intelligence that connects source code to the decisions and history b
 
 Requirements: Node.js 20.19+ or 22.12+.
 
-Python 3.11+ and `uv` are required for the API. Copy `server/.env.example` to `server/.env` and configure a Neo4j Aura database before live repository indexing. Do not commit `server/.env`.
+Python 3.11+ and `uv` are required for the API. Copy `server/.env.example` to `server/.env`, configure a Neo4j Aura database, and replace `SESSION_SECRET` with a private random value of at least 32 characters before live repository indexing. Keep the same secret between restarts so the browser can reopen and delete its stored graph. Do not commit `server/.env`.
 
 ```sh
 npm install

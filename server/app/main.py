@@ -34,6 +34,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("why.api")
 settings = get_settings()
+if settings.neo4j_configured and (
+    len(settings.session_secret) < 32
+    or "replace-with" in settings.session_secret.lower()
+    or "change-me" in settings.session_secret.lower()
+):
+    raise RuntimeError(
+        "Set SESSION_SECRET to a private random value of at least 32 characters. "
+        "A stable secret is required to preserve and safely delete browser-scoped Neo4j data."
+    )
 session_secret = settings.session_secret or secrets.token_urlsafe(48)
 
 
