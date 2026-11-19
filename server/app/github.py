@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import re
 import time
 from collections import OrderedDict
@@ -14,6 +15,12 @@ RAW_GITHUB = "https://raw.githubusercontent.com"
 SOURCE_CACHE_TTL_SECONDS = 300
 SOURCE_CACHE_MAX_ENTRIES = 128
 SOURCE_CHUNK_BYTES = 16_384
+API_CACHE_TTL_SECONDS = 180
+API_CACHE_MAX_ENTRIES = 256
+_API_CACHE: OrderedDict[
+    tuple[str, tuple[tuple[str, str], ...]], tuple[float, object]
+] = OrderedDict()
+_API_RATE_LIMITED_UNTIL = 0.0
 _SOURCE_CACHE: OrderedDict[
     tuple[str, str, str, str], tuple[float, dict[str, str | bool]]
 ] = OrderedDict()
@@ -214,14 +221,17 @@ def _import_targets(path: str, content: str, indexed_paths: set[str]) -> set[str
 class GitHubIndexer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        api_headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "Why-Repository-Intelligence",
+        }
+        if settings.github_api_token:
+            api_headers["Authorization"] = f"Bearer {settings.github_api_token}"
         self.api = httpx.AsyncClient(
             base_url=GITHUB_API,
             timeout=httpx.Timeout(settings.github_api_timeout_seconds),
-            headers={
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "Why-Repository-Intelligence",
-            },
+            headers=api_headers,
             follow_redirects=False,
         )
         self.raw = httpx.AsyncClient(
@@ -238,11 +248,31 @@ class GitHubIndexer:
     async def _get(
         self, endpoint: str, params: dict[str, str | int] | None = None
     ) -> object:
+        global _API_RATE_LIMITED_UNTIL
+        cache_key = (
+            endpoint,
+            tuple(sorted((str(key), str(value)) for key, value in (params or {}).items())),
+        )
+        now = time.monotonic()
+        cached = _API_CACHE.get(cache_key)
+        if cached is not None:
+            expires_at, payload = cached
+            if expires_at > now:
+                _API_CACHE.move_to_end(cache_key)
+                return copy.deepcopy(payload)
+            del _API_CACHE[cache_key]
+        if now < _API_RATE_LIMITED_UNTIL:
+            wait_seconds = max(1, int(_API_RATE_LIMITED_UNTIL - now))
+            raise GitHubError(
+                "github_rate_limited",
+                f"GitHub’s API limit was reached. Try again in about {wait_seconds // 60 + 1} minutes.",
+                429,
+            )
         self.request_count += 1
-        if self.request_count > 55:
+        if self.request_count > 24:
             raise GitHubError(
                 "github_request_budget",
-                "The import reached its safe GitHub request limit. Try a smaller repository or retry later.",
+                "This import reached its safe GitHub history request limit. Try again later.",
                 429,
             )
         try:
@@ -268,9 +298,16 @@ class GitHubIndexer:
             response.status_code == 403
             and response.headers.get("x-ratelimit-remaining") == "0"
         ):
+            reset_at = response.headers.get("x-ratelimit-reset")
+            try:
+                reset_epoch = int(reset_at) if reset_at else 0
+            except ValueError:
+                reset_epoch = 0
+            delay = max(60, reset_epoch - int(time.time())) if reset_epoch else 3600
+            _API_RATE_LIMITED_UNTIL = time.monotonic() + delay
             raise GitHubError(
                 "github_rate_limited",
-                "GitHub’s public API rate limit was reached. Try again later.",
+                f"GitHub’s API limit was reached. Try again in about {delay // 60 + 1} minutes.",
                 429,
             )
         if response.status_code in {401, 403}:
@@ -291,7 +328,12 @@ class GitHubIndexer:
                 f"GitHub returned an error ({response.status_code}).",
                 502,
             )
-        return response.json()
+        payload = response.json()
+        _API_CACHE[cache_key] = (time.monotonic() + API_CACHE_TTL_SECONDS, payload)
+        _API_CACHE.move_to_end(cache_key)
+        while len(_API_CACHE) > API_CACHE_MAX_ENTRIES:
+            _API_CACHE.popitem(last=False)
+        return copy.deepcopy(payload)
 
     async def _raw_file(
         self,
@@ -532,7 +574,7 @@ class GitHubIndexer:
             self._get(
                 f"{prefix}/commits/{quote(_clean_text(item.get('sha'), 64), safe='')}"
             )
-            for item in commits
+            for item in commits[:2]
             if _clean_text(item.get("sha"), 64)
         ]
         commit_details = await asyncio.gather(*commit_tasks, return_exceptions=True)
@@ -550,7 +592,9 @@ class GitHubIndexer:
 
         await progress("discussions", 48, "Connecting files to review discussions")
         pull_details_tasks = []
-        for pull in pulls[:6]:
+        # Keep the most useful discussion evidence while staying well below
+        # GitHub's shared anonymous quota on a hosted, multi-user service.
+        for pull in pulls[:3]:
             number = pull.get("number")
             if isinstance(number, int) and number > 0:
                 pull_details_tasks.extend(
@@ -580,7 +624,7 @@ class GitHubIndexer:
             if isinstance(item.get("number"), int)
         }
         comment_records: list[dict[str, object]] = []
-        for index, pull in enumerate(pulls[:6]):
+        for index, pull in enumerate(pulls[:3]):
             number = pull.get("number")
             if not isinstance(number, int) or number <= 0:
                 continue
@@ -685,6 +729,6 @@ class GitHubIndexer:
                 "tree_truncated": tree_truncated,
                 "partial_file_index": len(indexed_blobs)
                 >= self.settings.max_indexed_files,
-                "history_window": "latest 8 commits and pull requests; discussion details for latest 6 pull requests",
+                "history_window": "metadata for latest 8 commits and pull requests; changed-file details for latest 2 commits and latest 3 pull requests",
             },
         }

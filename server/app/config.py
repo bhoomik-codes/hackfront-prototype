@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     allowed_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
     github_client_id: str = ""
     github_client_secret: str = ""
+    github_api_token: str = ""
     github_oauth_callback_url: str = "http://127.0.0.1:8765/api/auth/github/callback"
     google_client_id: str = ""
     google_client_secret: str = ""
