@@ -76,7 +76,8 @@ async def _upsert_nodes(
         return
     query = f"UNWIND $rows AS row MERGE (n:{label} {{id: row.id}}) SET n += row"
     for start in range(0, len(rows), 400):
-        await transaction.run(query, rows=rows[start : start + 400]).consume()
+        result = await transaction.run(query, rows=rows[start : start + 400])
+        await result.consume()
 
 
 async def _upsert_edges(
@@ -91,11 +92,12 @@ async def _upsert_edges(
         f"MERGE (a)-[:{relationship}]->(b)"
     )
     for start in range(0, len(rows), 500):
-        await transaction.run(
+        result = await transaction.run(
             query,
             rows=rows[start : start + 500],
             repository_id=rows[0]["repository_id"],
-        ).consume()
+        )
+        await result.consume()
 
 
 async def index_repository(
@@ -113,7 +115,8 @@ async def index_repository(
 
     async with driver.session(database=database) as session:
         for statement in SCHEMA:
-            await session.run(statement).consume()
+            result = await session.run(statement)
+            await result.consume()
 
     repo_node = [
         {
@@ -453,10 +456,11 @@ async def index_repository(
             "Directory",
             "Repository",
         ):
-            await transaction.run(
+            result = await transaction.run(
                 f"MATCH (n:{label} {{repository_id: $repository_id}}) DETACH DELETE n",
                 repository_id=repository_id,
-            ).consume()
+            )
+            await result.consume()
         for label, rows in (
             ("Repository", repo_node),
             ("Directory", directory_rows),
@@ -664,10 +668,11 @@ async def delete_repository_graph(
 
     async def delete_snapshot(transaction: Any) -> None:
         for label in labels:
-            await transaction.run(
+            result = await transaction.run(
                 f"MATCH (n:{label} {{repository_id: $repository_id}}) DETACH DELETE n",
                 repository_id=repository_id,
-            ).consume()
+            )
+            await result.consume()
 
     async with driver.session(database=database) as session:
         await session.execute_write(delete_snapshot)
