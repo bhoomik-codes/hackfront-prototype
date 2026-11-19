@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "concurrently -k -n API,WEB -c green,cyan \"npm:server\" \"npm:client\"",
     "client": "vite",
-    "server": "uv --directory server run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload",
+    "server": "uv --directory server run uvicorn app.main:app --host 127.0.0.1 --port 8765 --reload",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"

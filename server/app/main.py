@@ -9,7 +9,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from neo4j import AsyncGraphDatabase
-from neo4j.exceptions import Neo4jError
+from neo4j.exceptions import DriverError, Neo4jError
 
 from .config import get_settings
 from .github import GitHubError, GitHubIndexer, parse_repository_url
@@ -234,17 +234,6 @@ async def _analyze_job(
             message=error.message,
             error_code=error.code,
         )
-    except Neo4jError:
-        logger.exception("Neo4j operation failed while indexing a repository")
-        _update_job(
-            request,
-            job_id,
-            status="failed",
-            stage="failed",
-            progress=100,
-            message="Neo4j could not save the repository graph. Check the Aura connection and try again.",
-            error_code="neo4j_error",
-        )
     except HTTPException as error:
         detail = error.detail if isinstance(error.detail, dict) else {}
         _update_job(
@@ -255,6 +244,17 @@ async def _analyze_job(
             progress=100,
             message=str(detail.get("message", "Indexing could not start.")),
             error_code=str(detail.get("code", "configuration_error")),
+        )
+    except (DriverError, Neo4jError, ExceptionGroup):
+        logger.exception("Neo4j operation failed while indexing a repository")
+        _update_job(
+            request,
+            job_id,
+            status="failed",
+            stage="failed",
+            progress=100,
+            message="Neo4j could not save the repository graph. Check the Aura connection and try again.",
+            error_code="neo4j_error",
         )
     except Exception:
         logger.exception("Unexpected repository indexing failure")
@@ -283,7 +283,8 @@ async def health(request: Request) -> dict[str, object]:
         }
     try:
         await driver.verify_connectivity()
-    except Neo4jError:
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
+        logger.warning("Neo4j health check failed (%s)", type(error).__name__)
         return {
             "status": "degraded",
             "neo4j_configured": True,
@@ -318,7 +319,7 @@ async def analyze_repository(
     driver = _driver(request)
     try:
         await driver.verify_connectivity()
-    except Neo4jError as error:
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
         raise HTTPException(
             status_code=503,
             detail={
@@ -398,7 +399,7 @@ async def list_repositories(request: Request) -> list[RepositorySummary]:
         repositories = await list_workspace_repositories(
             driver, settings.neo4j_database, _owner_key(request)
         )
-    except Neo4jError as error:
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
         logger.exception("Neo4j repository list query failed")
         raise HTTPException(
             status_code=503,
@@ -433,7 +434,7 @@ async def get_repository_graph(
         graph = await read_repository_graph(
             driver, settings.neo4j_database, repository_id, mode
         )
-    except Neo4jError as error:
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
         logger.exception("Neo4j graph query failed")
         raise HTTPException(
             status_code=503,
@@ -473,7 +474,7 @@ async def get_repository_file(
             id=repository_id,
             database_=settings.neo4j_database,
         )
-    except Neo4jError as error:
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
         raise HTTPException(
             status_code=503,
             detail={
@@ -515,7 +516,7 @@ async def delete_repository(owner: str, repository: str, request: Request) -> No
     driver = _driver(request)
     try:
         await delete_repository_graph(driver, settings.neo4j_database, repository_id)
-    except Neo4jError as error:
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
         raise HTTPException(
             status_code=503,
             detail={
