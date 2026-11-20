@@ -31,6 +31,20 @@ class TwoFactorEnrollmentVerifyRequest(BaseModel):
     code: str = Field(pattern=r"^\d{6}$")
 
 
+class ProfileNameUpdateRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=24, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{2,23}$")
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=12, max_length=128)
+
+
+class AccountDeleteRequest(BaseModel):
+    confirmation: Literal["DELETE"]
+    password: str | None = Field(default=None, max_length=128)
+
+
 class AnalyzeAccepted(BaseModel):
     job_id: str
     status: Literal["queued"]

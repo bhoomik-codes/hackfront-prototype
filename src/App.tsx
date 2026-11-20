@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Core, ElementDefinition } from 'cytoscape'
 import type { GraphMode, RepositoryGraphData, RepositoryGraphNode, RepositorySource, RepositorySummary } from './types'
-import { checkApiHealth, confirmTwoFactorEnrollment, deleteRepository, getAccountSettings, getAnalysisJob, getRepositories, getRepositoryFile, getRepositoryGraph, loginWithEmail, loginWithGitHub, loginWithGoogle, logout, registerEmailAccount, RepositoryApiError, saveRepository, startBrowserSession, startRepositoryAnalysis, updateTwoFactor, verifyEmailSignup, verifyEmailTwoFactor, type AccountSettings } from './services/repositoryApi'
+import { changeAccountPassword, checkApiHealth, confirmTwoFactorEnrollment, deleteAccount, deleteAccountRepositories, deleteRepository, getAccountSettings, getAnalysisJob, getRepositories, getRepositoryFile, getRepositoryGraph, loginWithEmail, loginWithGitHub, loginWithGoogle, logout, registerEmailAccount, RepositoryApiError, saveRepository, startBrowserSession, startRepositoryAnalysis, updateAccountProfile, updateTwoFactor, verifyEmailSignup, verifyEmailTwoFactor, type AccountSettings } from './services/repositoryApi'
 import { askWithEvidence, testModelConnection, type AssistantSettings, type EvidenceCitation } from './services/evidenceAssistant'
 import {
   ArrowDown, ArrowRight, ArrowsOut, BookOpenText,
@@ -320,6 +320,12 @@ function App() {
   const [showAccountSettings, setShowAccountSettings] = useState(false)
   const [accountInfo, setAccountInfo] = useState<AccountSettings | null>(null)
   const [accountPassword, setAccountPassword] = useState('')
+  const [accountRepositories, setAccountRepositories] = useState<RepositorySummary[]>([])
+  const [accountTab, setAccountTab] = useState<'profile' | 'repositories' | 'security' | 'danger'>('profile')
+  const [profileUsername, setProfileUsername] = useState('')
+  const [newAccountPassword, setNewAccountPassword] = useState('')
+  const [deleteAccountPassword, setDeleteAccountPassword] = useState('')
+  const [deleteConfirmation, setDeleteConfirmation] = useState('')
   const [accountMessage, setAccountMessage] = useState('')
   const [accountBusy, setAccountBusy] = useState(false)
   const [twoFactorEnrollment, setTwoFactorEnrollment] = useState(false)
@@ -349,6 +355,22 @@ function App() {
     if (authResult && authResult !== 'success') return 'GitHub sign-in did not complete. Please try again.'
     return ''
   })
+  useEffect(() => {
+    const labelButtons = () => document.querySelectorAll<HTMLButtonElement>('button').forEach((button) => {
+      const accessibleLabel = button.getAttribute('aria-label')?.trim()
+      const visibleLabel = button.innerText.replace(/\s+/g, ' ').trim()
+      const label = accessibleLabel || visibleLabel
+      if (!label) return
+      if (!button.title || button.dataset.autoHoverTitle === 'true') {
+        button.title = label
+        button.dataset.autoHoverTitle = 'true'
+      }
+    })
+    labelButtons()
+    const observer = new MutationObserver(labelButtons)
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+    return () => observer.disconnect()
+  }, [])
   const nodes = toDisplayNodes(mode, liveGraph)
   const selected = nodes.find((node) => node.id === selectedId) ?? nodes[0]
   const connectedNodes = liveGraph && selected
@@ -389,6 +411,12 @@ function App() {
         setGithubOAuthConfigured(Boolean(session.github_oauth_configured ?? session.oauth_configured))
         setGoogleOAuthConfigured(Boolean(session.google_oauth_configured))
         setEmailAuthConfigured(Boolean(session.email_auth_configured))
+      }
+      if (session.authenticated) {
+        try {
+          const account = await getAccountSettings()
+          if (active) setAccountInfo(account)
+        } catch { /* profile details are loaded again when the account panel opens */ }
       }
       const health = await checkApiHealth()
       if (active) setApiHealth({ ready: health.status === 'ready' && health.neo4j_configured, message: health.message ?? '' })
@@ -570,6 +598,7 @@ function App() {
     setShowAuth(false)
     setNotice(`Signed in as ${login}. You can now choose which indexes to save.`)
     setAuthMessage('')
+    void getAccountSettings().then(setAccountInfo).catch(() => { /* account panel will report a useful error if opened */ })
     void getRepositories().then(setSavedRepositories).catch(() => { /* sign-in remains available without saved-index refresh */ })
   }
 
@@ -620,13 +649,116 @@ function App() {
   const openAccountSettings = async () => {
     setAccountMessage('Loading account settings…')
     setAccountPassword('')
+    setNewAccountPassword('')
+    setDeleteAccountPassword('')
+    setDeleteConfirmation('')
+    setTwoFactorEnrollment(false)
+    setTwoFactorCode('')
+    setAccountInfo(null)
+    setAccountRepositories([])
+    setAccountTab('profile')
+    setAccountBusy(true)
     setShowAccountSettings(true)
     try {
-      setAccountInfo(await getAccountSettings())
+      const info = await getAccountSettings()
+      setAccountInfo(info)
+      setProfileUsername(info.username)
       setAccountMessage('')
+      try {
+        setAccountRepositories(await getRepositories())
+      } catch {
+        setAccountMessage('Your profile is ready, but the repository list could not be loaded. Try again shortly.')
+      }
     } catch (error) {
       setAccountMessage(error instanceof Error ? error.message : 'Account settings could not be loaded.')
-    }
+    } finally { setAccountBusy(false) }
+  }
+
+  const handleSaveAccountProfile = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setAccountBusy(true)
+    setAccountMessage('')
+    try {
+      const result = await updateAccountProfile(profileUsername.trim())
+      setAccountInfo((current) => current ? { ...current, username: result.username } : current)
+      setProfileUsername(result.username)
+      setAccountMessage('Your display name has been updated.')
+    } catch (error) {
+      setAccountMessage(error instanceof Error ? error.message : 'Your profile could not be updated.')
+    } finally { setAccountBusy(false) }
+  }
+
+  const handleChangeAccountPassword = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setAccountBusy(true)
+    setAccountMessage('')
+    try {
+      await changeAccountPassword(accountPassword, newAccountPassword)
+      setAccountPassword('')
+      setNewAccountPassword('')
+      setAccountMessage('Your password has been changed.')
+    } catch (error) {
+      setAccountMessage(error instanceof Error ? error.message : 'Your password could not be changed.')
+    } finally { setAccountBusy(false) }
+  }
+
+  const resetActiveRepositoryView = () => {
+    setWorkspace(false)
+    setActiveRepository(null)
+    setActiveIsSaved(false)
+    setLiveGraph(null)
+    setCurrentSource(null)
+    setSourceError('')
+  }
+
+  const handleRemoveAccountRepository = async (repository: RepositorySummary) => {
+    if (!window.confirm(`Delete the saved index for ${repository.full_name}?`)) return
+    setAccountBusy(true)
+    setAccountMessage('')
+    try {
+      await deleteRepository(repository.owner, repository.repository)
+      setAccountRepositories((items) => items.filter((item) => item.full_name !== repository.full_name))
+      setSavedRepositories((items) => items.filter((item) => item.full_name !== repository.full_name))
+      if (activeRepository?.fullName === repository.full_name) resetActiveRepositoryView()
+      setAccountMessage(`${repository.full_name} was removed from your saved indexes.`)
+    } catch (error) {
+      setAccountMessage(error instanceof Error ? error.message : 'The repository index could not be deleted.')
+    } finally { setAccountBusy(false) }
+  }
+
+  const handleDeleteAllRepositories = async () => {
+    if (!window.confirm('Delete every saved index and temporary index in this browser session? This cannot be undone.')) return
+    setAccountBusy(true)
+    setAccountMessage('Deleting repository indexes…')
+    try {
+      const result = await deleteAccountRepositories()
+      setAccountRepositories([])
+      setSavedRepositories([])
+      resetActiveRepositoryView()
+      setShowAccountSettings(false)
+      setNotice(`Deleted ${result.deleted} repository index${result.deleted === 1 ? '' : 'es'}.`)
+    } catch (error) {
+      setAccountMessage(error instanceof Error ? error.message : 'Repository indexes could not be deleted.')
+    } finally { setAccountBusy(false) }
+  }
+
+  const handleDeleteAccount = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (deleteConfirmation !== 'DELETE') return
+    setAccountBusy(true)
+    setAccountMessage('Deleting your account and repository indexes…')
+    try {
+      await deleteAccount('DELETE', accountInfo?.provider === 'email' ? deleteAccountPassword : undefined)
+      setGithubLogin(null)
+      setAccountInfo(null)
+      setAccountRepositories([])
+      setSavedRepositories([])
+      setShowAccountSettings(false)
+      resetActiveRepositoryView()
+      setNotice('Your account and its repository indexes have been deleted.')
+    } catch (error) {
+      setAccountMessage(error instanceof Error ? error.message : 'Your account could not be deleted.')
+    } finally { setAccountBusy(false) }
   }
 
   const handleToggleTwoFactor = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -682,6 +814,7 @@ function App() {
     try {
       await logout()
       setGithubLogin(null)
+      setAccountInfo(null)
       setShowAccountSettings(false)
       setActiveIsSaved(false)
       setSavedRepositories([])
@@ -791,7 +924,7 @@ function App() {
       {!workspace ? <section className="landing">
         <header className="landing-nav">
           <a className="brand" href="#top" aria-label="Why the Code home"><img className="brand-symbol" src="/brand-mark.svg" alt="" /><span>why<span className="brand-period">.</span></span></a>
-          <div className="nav-right"><span className="nav-status"><span className={`status-dot ${apiHealth?.ready ? '' : 'muted-dot'}`} /> {apiHealth?.ready ? 'Neo4j graph ready' : 'Evidence-first analysis'}</span>{githubLogin ? <button className="nav-link" onClick={() => void openAccountSettings()}>@{githubLogin} · Account</button> : <button className="nav-link" onClick={openAuthDialog}>Sign in</button>}<button className="nav-link" onClick={handleDemo}>Explore sample <ArrowRight size={15} /></button></div>
+          <div className="nav-right"><span className="nav-status"><span className={`status-dot ${apiHealth?.ready ? '' : 'muted-dot'}`} /> {apiHealth?.ready ? 'Neo4j graph ready' : 'Evidence-first analysis'}</span>{githubLogin ? <button className="nav-link" title="Open your profile and account settings" onClick={() => void openAccountSettings()}>@{accountInfo?.username ?? githubLogin} · Profile</button> : <button className="nav-link" onClick={openAuthDialog}>Sign in</button>}<button className="nav-link" onClick={handleDemo}>Explore sample <ArrowRight size={15} /></button></div>
         </header>
         <div className="landing-grid" id="top">
           <section className="hero-copy">
@@ -842,7 +975,7 @@ function App() {
         <header className="workspace-topbar">
           <a className="brand" href="#top" onClick={(event) => { event.preventDefault(); leaveCurrentRepository() }} aria-label="Why the Code home"><img className="brand-symbol" src="/brand-mark.svg" alt="" /><span>why<span className="brand-period">.</span></span></a>
           <div className="repo-crumb"><span className="crumb-slash">/</span><GithubLogo size={15} weight="fill" /><b>{activeRepository?.fullName ?? 'vercel / next.js'}</b><span className="sample-tag">{activeRepository ? 'INDEXED' : 'SAMPLE'}</span><CaretDown size={13} /></div>
-          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? activeIsSaved ? 'Saved index' : 'Temporary index' : 'Preview data only'}</span>{activeRepository && !activeIsSaved && <button className="topbar-save" onClick={() => void handleSaveIndex()}>{githubLogin ? 'Save index' : 'Sign in to save'}</button>}{githubLogin && <button className="topbar-account" onClick={() => void openAccountSettings()} title="Account settings">@{githubLogin}</button>}{activeRepository && <button className="topbar-icon" aria-label="Remove repository index" title="Remove repository graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={leaveCurrentRepository}><Plus size={16} /> New repo</button></div>
+          <div className="topbar-right"><span className="indexed-status"><span className={`status-dot ${activeRepository ? '' : 'muted-dot'}`} /> {activeRepository ? activeIsSaved ? 'Saved index' : 'Temporary index' : 'Preview data only'}</span>{activeRepository && !activeIsSaved && <button className="topbar-save" onClick={() => void handleSaveIndex()}>{githubLogin ? 'Save index' : 'Sign in to save'}</button>}{githubLogin && <button className="topbar-account" onClick={() => void openAccountSettings()} title="Open your profile and account settings">@{accountInfo?.username ?? githubLogin}</button>}{activeRepository && <button className="topbar-icon" aria-label="Remove repository index" title="Remove repository graph" onClick={() => void removeIndexedRepository()}><Trash size={16} /></button>}<button className="topbar-new" onClick={leaveCurrentRepository}><Plus size={16} /> New repo</button></div>
         </header>
         <div className="workspace-body">
           <aside className="left-rail">
@@ -852,7 +985,7 @@ function App() {
             <span className="rail-spacer" />
             <button className="rail-item" aria-label="Privacy details" title="Privacy details" onClick={() => setNotice('Privacy: repository source is fetched for analysis and previews, then kept in short-lived server memory only. Graph metadata is temporary in Neo4j unless you explicitly save the index.') }><ShieldCheck size={19} /></button>
             <button className="rail-item" aria-label={showInspector ? 'Hide details panel' : 'Show details panel'} title={showInspector ? 'Hide details panel' : 'Show details panel'} onClick={() => setShowInspector((open) => !open)}><FileCode size={19} /></button>
-            <div className="rail-avatar">W</div>
+            <button className="rail-avatar" aria-label={githubLogin ? 'Open your profile and account settings' : 'Sign in to your account'} title={githubLogin ? 'Open your profile and account settings' : 'Sign in'} onClick={() => githubLogin ? void openAccountSettings() : openAuthDialog}>{accountInfo?.username?.slice(0, 1).toUpperCase() ?? githubLogin?.slice(0, 1).toUpperCase() ?? 'W'}</button>
           </aside>
           <section className="graph-area">
             <div className="workspace-heading">
@@ -934,10 +1067,30 @@ function App() {
         <section className="auth-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="account-title">
           <button className="auth-close" aria-label="Close account settings" onClick={() => setShowAccountSettings(false)}><X size={17} /></button>
           <span className="auth-eyebrow">SETTINGS / ACCOUNT</span>
-          <h2 id="account-title">Account security</h2>
+          <h2 id="account-title">Your account</h2>
           {accountInfo ? <>
             <div className="account-identity"><span>{accountInfo.provider === 'email' ? 'EMAIL ACCOUNT' : `${accountInfo.provider?.toUpperCase() ?? 'ACCOUNT'} SIGN-IN`}</span><b>{accountInfo.email ?? githubLogin ?? 'Signed-in account'}</b></div>
-            {accountInfo.provider === 'email' ? <>
+            <div className="account-tabs" role="tablist" aria-label="Account settings"><button role="tab" aria-selected={accountTab === 'profile'} className={accountTab === 'profile' ? 'active' : ''} onClick={() => setAccountTab('profile')}>Profile</button><button role="tab" aria-selected={accountTab === 'repositories'} className={accountTab === 'repositories' ? 'active' : ''} onClick={() => setAccountTab('repositories')}>Repositories</button><button role="tab" aria-selected={accountTab === 'security'} className={accountTab === 'security' ? 'active' : ''} onClick={() => setAccountTab('security')}>Security</button><button role="tab" aria-selected={accountTab === 'danger'} className={accountTab === 'danger' ? 'active' : ''} onClick={() => setAccountTab('danger')}>Account</button></div>
+            {accountTab === 'profile' && <div className="account-tab-content">
+              <form className="account-security-form" onSubmit={(event) => void handleSaveAccountProfile(event)}>
+                <label htmlFor="profile-username">Display name</label>
+                <div className="username-field"><span>@</span><input id="profile-username" autoComplete="nickname" minLength={3} maxLength={24} pattern="[A-Za-z0-9][A-Za-z0-9_-]{2,23}" required value={profileUsername} onChange={(event) => setProfileUsername(event.target.value)} disabled={accountBusy} /></div>
+                <small className="account-help">3–24 characters: letters, numbers, underscore, or hyphen. This changes your name in Why, not your GitHub or Google account.</small>
+                <button className="auth-submit" type="submit" disabled={accountBusy || !profileUsername.trim()}>{accountBusy ? 'Saving…' : 'Save display name'}</button>
+              </form>
+              {accountInfo.provider === 'email' ? <form className="account-security-form account-divider" onSubmit={(event) => void handleChangeAccountPassword(event)}>
+                <b className="account-section-title">Change password</b>
+                <label htmlFor="account-current-password">Current password</label><input id="account-current-password" type="password" autoComplete="current-password" minLength={1} maxLength={128} required value={accountPassword} onChange={(event) => setAccountPassword(event.target.value)} disabled={accountBusy} />
+                <label htmlFor="account-new-password">New password · at least 12 characters</label><input id="account-new-password" type="password" autoComplete="new-password" minLength={12} maxLength={128} required value={newAccountPassword} onChange={(event) => setNewAccountPassword(event.target.value)} disabled={accountBusy} />
+                <button className="auth-submit" type="submit" disabled={accountBusy || !accountPassword || newAccountPassword.length < 12}>{accountBusy ? 'Saving…' : 'Change password'}</button>
+              </form> : <p className="account-help">This account signs in through {accountInfo.provider === 'google' ? 'Google' : 'GitHub'}, so password changes are managed by that provider.</p>}
+            </div>}
+            {accountTab === 'repositories' && <div className="account-tab-content">
+              <div className="account-list-heading"><b>Repository indexes</b><span>{accountRepositories.length}</span></div>
+              {accountRepositories.length ? <div className="account-repo-list">{accountRepositories.map((repository) => <div className="account-repo-row" key={repository.full_name}><button className="account-repo-open" title={`Open ${repository.full_name}`} onClick={() => { openSavedRepository(repository); setShowAccountSettings(false) }}><GithubLogo size={15} weight="fill" /><span><b>{repository.full_name}</b><small>{repository.is_saved ? 'Saved to your account' : 'Temporary · this browser'} · {repository.default_branch}</small></span><ArrowRight size={14} /></button><button className="account-repo-delete" aria-label={`Delete ${repository.full_name}`} title={`Delete ${repository.full_name}`} disabled={accountBusy} onClick={() => void handleRemoveAccountRepository(repository)}><Trash size={14} /></button></div>)}</div> : <p className="account-empty">{accountBusy ? 'Loading repository indexes…' : 'No indexes found. Saved repositories will stay here; temporary indexes expire automatically.'}</p>}
+              <button className="account-secondary-action" disabled={accountBusy || accountRepositories.length === 0} onClick={() => void handleDeleteAllRepositories()}>Delete all repository indexes</button>
+            </div>}
+            {accountTab === 'security' && <div className="account-tab-content">{accountInfo.provider === 'email' ? <>
               <form className="account-security-form" onSubmit={(event) => void handleToggleTwoFactor(event)}>
               <div className="account-2fa-state"><span><b>Email two-step verification</b><small>{accountInfo.two_factor_enabled ? 'A code is required each time you sign in.' : 'Password only at sign-in.'}</small></span><span className={`account-state-pill ${accountInfo.two_factor_enabled ? 'enabled' : ''}`}>{accountInfo.two_factor_enabled ? 'ON' : 'OFF'}</span></div>
               {!accountInfo.two_factor_available && <p>Configure Gmail SMTP before turning this on, so sign-in codes can be delivered.</p>}
@@ -950,10 +1103,11 @@ function App() {
                 <input id="account-two-factor-code" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} required value={twoFactorCode} onChange={(event) => setTwoFactorCode(event.target.value.replace(/\D/g, '').slice(0, 6))} placeholder="000000" disabled={accountBusy} />
                 <button className="auth-submit" type="submit" disabled={accountBusy || twoFactorCode.length !== 6}>{accountBusy ? 'Verifying…' : 'Verify and enable'}</button>
               </form>}
-            </> : <p>Two-step verification for this account is managed by {accountInfo.provider === 'google' ? 'Google' : 'GitHub'}.</p>}
+            </> : <p className="account-help">Two-step verification for this account is managed by {accountInfo.provider === 'google' ? 'Google' : 'GitHub'}.</p>}</div>}
+            {accountTab === 'danger' && <div className="account-tab-content danger-zone"><b className="account-section-title">Delete account</b><p>This permanently removes your saved indexes and account profile. Temporary indexes for this browser session are removed too.</p><form className="account-security-form" onSubmit={(event) => void handleDeleteAccount(event)}><label htmlFor="delete-confirmation">Type DELETE to confirm</label><input id="delete-confirmation" value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.target.value)} autoComplete="off" disabled={accountBusy} />{accountInfo.provider === 'email' && <><label htmlFor="delete-account-password">Current password</label><input id="delete-account-password" type="password" autoComplete="current-password" required value={deleteAccountPassword} onChange={(event) => setDeleteAccountPassword(event.target.value)} disabled={accountBusy} /></>}<button className="danger-button" type="submit" disabled={accountBusy || deleteConfirmation !== 'DELETE' || (accountInfo.provider === 'email' && !deleteAccountPassword)}>{accountBusy ? 'Deleting…' : 'Permanently delete account'}</button></form></div>}
           </> : <p>{accountMessage || 'Loading account settings…'}</p>}
           {accountMessage && accountInfo && <p className="auth-message" role="status">{accountMessage}</p>}
-          <button className="auth-signout" onClick={() => void handleLogout()}>Sign out</button>
+          <div className="account-footer"><button className="auth-signout" title="Sign out of Why" onClick={() => void handleLogout()}>Sign out</button><span>Account actions affect only your signed-in account.</span></div>
         </section>
       </div>}
     </main>

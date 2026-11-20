@@ -27,20 +27,27 @@ from neo4j.exceptions import DriverError, Neo4jError
 
 from .accounts import (
     clear_expired_account_challenges,
+    clear_identity_revocation,
     clear_two_factor_enrollment,
     complete_pending_signup,
     confirm_two_factor_enrollment,
     consume_two_factor_challenge,
     create_pending_signup_if_absent,
+    delete_account_identity,
     delete_pending_signup,
+    ensure_account_schema,
     get_account,
     get_pending_signup,
+    get_profile_name,
     has_active_auth_challenge,
     increment_pending_signup_attempts,
     increment_two_factor_attempts,
     increment_two_factor_enrollment_attempts,
+    is_identity_revoked,
     prepare_two_factor_enrollment,
     set_two_factor_enabled,
+    update_account_password,
+    update_profile_name,
     update_two_factor_challenge,
 )
 from .config import get_settings
@@ -48,6 +55,7 @@ from .github import GitHubError, GitHubIndexer, parse_repository_url
 from .graph import (
     delete_expired_repository_graphs,
     delete_repository_graph,
+    delete_user_saved_repositories,
     delete_workspace_repositories,
     find_accessible_repository_id,
     find_saved_repository_id,
@@ -59,12 +67,15 @@ from .graph import (
 )
 from .passwords import hash_password, verify_password
 from .schemas import (
+    AccountDeleteRequest,
     AnalyzeAccepted,
     AnalyzeRequest,
     EmailCodeVerifyRequest,
     EmailPasswordLoginRequest,
     EmailSignupRequest,
     JobState,
+    PasswordChangeRequest,
+    ProfileNameUpdateRequest,
     RepositoryFile,
     RepositoryGraph,
     RepositorySummary,
@@ -155,6 +166,10 @@ async def lifespan(app: FastAPI):
             auth=(settings.neo4j_username, settings.neo4j_password),
             connection_timeout=8,
         )
+        try:
+            await ensure_account_schema(app.state.driver, settings.neo4j_database)
+        except (DriverError, Neo4jError, ExceptionGroup) as error:
+            logger.warning("Account schema initialization failed (%s)", type(error).__name__)
         cleanup_task = asyncio.create_task(_expiry_sweeper(app.state.driver))
     try:
         yield
@@ -180,10 +195,32 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type"],
     max_age=600,
 )
+
+
+async def _call_if_identity_active(request: Request, call_next):
+    user_id = getattr(request.state, "auth_user_id", None)
+    driver = request.app.state.driver
+    if user_id and driver is not None:
+        try:
+            revoked = await is_identity_revoked(
+                driver, settings.neo4j_database, str(user_id)
+            )
+        except (DriverError, Neo4jError, ExceptionGroup) as error:
+            logger.warning("Account revocation check failed (%s)", type(error).__name__)
+            return JSONResponse(
+                status_code=503,
+                content={"detail": {"code": "account_check_unavailable", "message": "Account access could not be verified. Try again shortly."}},
+            )
+        if revoked:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": {"code": "account_deleted", "message": "This account has been deleted. Sign in again to continue."}},
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -267,7 +304,7 @@ async def secure_api_response(request: Request, call_next):
                     request.state.auth_user_id = claims.get("user_id")
                     request.state.auth_login = claims.get("login")
                     request.state.auth_provider = _provider_for_claims(claims)
-                    response = await call_next(request)
+                    response = await _call_if_identity_active(request, call_next)
             else:
                 request.state.workspace_id = workspace_id
                 claims = (
@@ -277,7 +314,7 @@ async def secure_api_response(request: Request, call_next):
                 request.state.auth_user_id = claims.get("user_id")
                 request.state.auth_login = claims.get("login")
                 request.state.auth_provider = _provider_for_claims(claims)
-                response = await call_next(request)
+                response = await _call_if_identity_active(request, call_next)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -577,6 +614,31 @@ async def browser_session(request: Request) -> dict[str, object]:
         )
         _set_session_cookie(response, token)
         return response
+    user_id = claims.get("user_id")
+    if user_id and request.app.state.driver is not None:
+        try:
+            revoked = await is_identity_revoked(
+                request.app.state.driver, settings.neo4j_database, str(user_id)
+            )
+        except (DriverError, Neo4jError, ExceptionGroup) as error:
+            logger.warning("Account session check failed (%s)", type(error).__name__)
+            revoked = False
+        if revoked:
+            _workspace_id, token = create_session(session_secret)
+            response = JSONResponse(
+                {
+                    "ready": True,
+                    "authenticated": False,
+                    "login": None,
+                    "auth_provider": None,
+                    "oauth_configured": settings.github_oauth_configured,
+                    "github_oauth_configured": settings.github_oauth_configured,
+                    "google_oauth_configured": settings.google_oauth_configured,
+                    "email_auth_configured": settings.email_auth_configured,
+                }
+            )
+            _set_session_cookie(response, token)
+            return response
     return {
         "ready": True,
         "authenticated": bool(claims.get("user_id")),
@@ -762,6 +824,7 @@ async def verify_email_code(body: EmailCodeVerifyRequest, request: Request) -> R
                 "message": "An account for that address already exists. Sign in instead.",
             },
         )
+    await clear_identity_revocation(driver, settings.neo4j_database, account_id)
     claims = session_claims(request.cookies.get(SESSION_COOKIE), session_secret) or {}
     existing_workspace = str(claims.get("workspace_id", workspace_id))
     if _workspace_closed(request, existing_workspace):
@@ -832,6 +895,7 @@ async def login_email(body: EmailPasswordLoginRequest, request: Request) -> Resp
         return JSONResponse(
             {"authenticated": False, "requires_2fa": True, "login": email}
         )
+    await clear_identity_revocation(driver, settings.neo4j_database, account_id)
     claims = session_claims(request.cookies.get(SESSION_COOKIE), session_secret) or {}
     existing_workspace = str(claims.get("workspace_id", _owner_key(request)))
     if _workspace_closed(request, existing_workspace):
@@ -896,6 +960,7 @@ async def verify_email_two_factor(
             },
         )
     await consume_two_factor_challenge(driver, settings.neo4j_database, account_id)
+    await clear_identity_revocation(driver, settings.neo4j_database, account_id)
     claims = session_claims(request.cookies.get(SESSION_COOKIE), session_secret) or {}
     existing_workspace = str(claims.get("workspace_id", workspace_id))
     if _workspace_closed(request, existing_workspace):
@@ -921,15 +986,14 @@ async def account_settings(request: Request) -> dict[str, object]:
                 "message": "Sign in to view account settings.",
             },
         )
-    if provider != "email":
-        return {
-            "email": login if isinstance(login, str) and "@" in login else None,
-            "provider": provider,
-            "two_factor_enabled": False,
-            "two_factor_available": False,
-        }
+    driver = _driver(request)
     try:
-        account = await get_account(_driver(request), settings.neo4j_database, user_id)
+        username = await get_profile_name(driver, settings.neo4j_database, user_id)
+        account = (
+            await get_account(driver, settings.neo4j_database, user_id)
+            if provider == "email"
+            else None
+        )
     except (DriverError, Neo4jError, ExceptionGroup) as error:
         logger.warning(
             "Email account settings lookup failed (%s)", type(error).__name__
@@ -941,7 +1005,7 @@ async def account_settings(request: Request) -> dict[str, object]:
                 "message": "Account settings are temporarily unavailable.",
             },
         ) from error
-    if not account:
+    if provider == "email" and not account:
         raise HTTPException(
             status_code=404,
             detail={
@@ -949,12 +1013,114 @@ async def account_settings(request: Request) -> dict[str, object]:
                 "message": "This email account could not be found.",
             },
         )
+    fallback_username = re.sub(r"[^A-Za-z0-9_-]+", "-", str(login or "developer")).strip("-_")[:24]
+    if len(fallback_username) < 3 or not fallback_username[0].isalnum():
+        fallback_username = "developer"
     return {
-        "email": account.get("email"),
-        "provider": "email",
-        "two_factor_enabled": bool(account.get("two_factor_enabled")),
-        "two_factor_available": settings.email_auth_configured,
+        "email": account.get("email") if account else (login if isinstance(login, str) and "@" in login else None),
+        "provider": provider,
+        "username": username or fallback_username,
+        "two_factor_enabled": bool(account.get("two_factor_enabled")) if account else False,
+        "two_factor_available": settings.email_auth_configured if account else False,
     }
+
+
+@app.put("/api/account/profile")
+async def update_account_profile(
+    body: ProfileNameUpdateRequest, request: Request
+) -> dict[str, str]:
+    user_id = _authenticated_user_id(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail={"code": "account_sign_in_required", "message": "Sign in to update your profile."})
+    try:
+        await update_profile_name(_driver(request), settings.neo4j_database, user_id, body.username)
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
+        logger.warning("Account profile update failed (%s)", type(error).__name__)
+        raise HTTPException(status_code=503, detail={"code": "account_storage_unavailable", "message": "Your profile could not be updated. Try again shortly."}) from error
+    return {"username": body.username}
+
+
+@app.put("/api/account/password")
+async def change_account_password(
+    body: PasswordChangeRequest, request: Request
+) -> Response:
+    user_id = _authenticated_user_id(request)
+    if not user_id or getattr(request.state, "auth_provider", None) != "email":
+        raise HTTPException(status_code=403, detail={"code": "email_account_required", "message": "Only email and password accounts can change a password here."})
+    try:
+        driver = _driver(request)
+        account = await get_account(driver, settings.neo4j_database, user_id)
+        valid_password = await _password_work(
+            verify_password, body.current_password,
+            str(account.get("password_hash")) if account and account.get("password_hash") else None,
+        )
+        if not account or not valid_password:
+            raise HTTPException(status_code=401, detail={"code": "account_password_invalid", "message": "Current password is incorrect."})
+        password_hash = await _password_work(hash_password, body.new_password)
+        changed = await update_account_password(driver, settings.neo4j_database, user_id, password_hash)
+        if not changed:
+            raise HTTPException(status_code=404, detail={"code": "email_account_not_found", "message": "This email account could not be found."})
+    except HTTPException:
+        raise
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
+        logger.warning("Account password update failed (%s)", type(error).__name__)
+        raise HTTPException(status_code=503, detail={"code": "account_storage_unavailable", "message": "Your password could not be updated. Try again shortly."}) from error
+    return Response(status_code=204)
+
+
+@app.delete("/api/account/repositories")
+async def delete_account_repositories(request: Request) -> dict[str, int]:
+    user_id = _authenticated_user_id(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail={"code": "account_sign_in_required", "message": "Sign in to delete your saved repositories."})
+    try:
+        driver = _driver(request)
+        saved = await delete_user_saved_repositories(driver, settings.neo4j_database, user_id)
+        temporary = await delete_workspace_repositories(driver, settings.neo4j_database, _owner_key(request))
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
+        logger.warning("Account repository cleanup failed (%s)", type(error).__name__)
+        raise HTTPException(status_code=503, detail={"code": "repository_cleanup_failed", "message": "Your repository indexes could not all be deleted. Try again shortly."}) from error
+    return {"deleted": saved + temporary}
+
+
+@app.delete("/api/account", status_code=204)
+async def delete_account(
+    body: AccountDeleteRequest, request: Request
+) -> Response:
+    user_id = _authenticated_user_id(request)
+    provider = getattr(request.state, "auth_provider", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail={"code": "account_sign_in_required", "message": "Sign in to delete your account."})
+    driver = _driver(request)
+    if provider == "email":
+        if not body.password:
+            raise HTTPException(status_code=422, detail={"code": "account_password_required", "message": "Enter your current password to delete this account."})
+        try:
+            account = await get_account(driver, settings.neo4j_database, user_id)
+            valid_password = await _password_work(
+                verify_password, body.password,
+                str(account.get("password_hash")) if account and account.get("password_hash") else None,
+            )
+        except (DriverError, Neo4jError, ExceptionGroup) as error:
+            logger.warning("Account deletion verification failed (%s)", type(error).__name__)
+            raise HTTPException(status_code=503, detail={"code": "account_storage_unavailable", "message": "Your account could not be verified for deletion. Try again shortly."}) from error
+        if not account or not valid_password:
+            raise HTTPException(status_code=401, detail={"code": "account_password_invalid", "message": "Current password is incorrect."})
+    workspace_id = _owner_key(request)
+    request.app.state.closed_workspaces[workspace_id] = time.monotonic() + 21_600
+    lock = request.app.state.workspace_locks.setdefault(workspace_id, asyncio.Lock())
+    try:
+        async with lock:
+            await delete_workspace_repositories(driver, settings.neo4j_database, workspace_id)
+            await delete_user_saved_repositories(driver, settings.neo4j_database, user_id)
+            await delete_account_identity(driver, settings.neo4j_database, user_id)
+    except (DriverError, Neo4jError, ExceptionGroup) as error:
+        logger.warning("Account deletion failed (%s)", type(error).__name__)
+        raise HTTPException(status_code=503, detail={"code": "account_delete_failed", "message": "Your account data could not be fully removed. Try again shortly."}) from error
+    _new_workspace_id, token = create_session(session_secret)
+    response = Response(status_code=204)
+    _set_session_cookie(response, token)
+    return response
 
 
 @app.post("/api/account/two-factor")
@@ -1161,6 +1327,8 @@ async def finish_github_login(request: Request, code: str = "", state: str = "")
         return response
     finally:
         access_token = None
+    if request.app.state.driver is not None:
+        await clear_identity_revocation(request.app.state.driver, settings.neo4j_database, str(github_id))
     existing_claims = session_claims(
         request.cookies.get(SESSION_COOKIE), session_secret
     )
@@ -1269,6 +1437,8 @@ async def finish_google_login(request: Request, code: str = "", state: str = "")
         return response
     finally:
         access_token = None
+    if request.app.state.driver is not None:
+        await clear_identity_revocation(request.app.state.driver, settings.neo4j_database, f"google:{google_sub}")
     existing_claims = session_claims(
         request.cookies.get(SESSION_COOKIE), session_secret
     )

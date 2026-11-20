@@ -1,3 +1,4 @@
+import time
 from typing import Any
 
 from neo4j import AsyncDriver
@@ -8,6 +9,8 @@ async def ensure_account_schema(driver: AsyncDriver, database: str) -> None:
         for statement in (
             "CREATE CONSTRAINT account_id IF NOT EXISTS FOR (n:Account) REQUIRE n.id IS UNIQUE",
             "CREATE CONSTRAINT pending_signup_id IF NOT EXISTS FOR (n:PendingSignup) REQUIRE n.id IS UNIQUE",
+            "CREATE CONSTRAINT account_profile_id IF NOT EXISTS FOR (n:AccountProfile) REQUIRE n.id IS UNIQUE",
+            "CREATE CONSTRAINT revoked_identity_id IF NOT EXISTS FOR (n:RevokedIdentity) REQUIRE n.id IS UNIQUE",
         ):
             result = await session.run(statement)
             await result.consume()
@@ -32,6 +35,88 @@ async def get_account(
         database_=database,
     )
     return dict(rows[0]) if rows else None
+
+
+async def get_profile_name(
+    driver: AsyncDriver, database: str, user_id: str
+) -> str | None:
+    rows, _, _ = await driver.execute_query(
+        "MATCH (p:AccountProfile {id: $id}) RETURN p.username AS username",
+        id=user_id,
+        database_=database,
+    )
+    return str(rows[0]["username"]) if rows and rows[0]["username"] else None
+
+
+async def update_profile_name(
+    driver: AsyncDriver, database: str, user_id: str, username: str
+) -> None:
+    await ensure_account_schema(driver, database)
+    await driver.execute_query(
+        "MERGE (p:AccountProfile {id: $id}) SET p.username = $username, "
+        "p.updated_at = $now REMOVE p.deleted_at",
+        id=user_id,
+        username=username,
+        now=time.time(),
+        database_=database,
+    )
+
+
+async def update_account_password(
+    driver: AsyncDriver, database: str, account_id: str, password_hash: str
+) -> bool:
+    rows, _, _ = await driver.execute_query(
+        "MATCH (a:Account {id: $id, email_verified: true}) "
+        "SET a.password_hash = $password_hash, a.password_updated_at = $now "
+        "REMOVE a.two_factor_digest, a.two_factor_expires, a.two_factor_workspace, "
+        "a.two_factor_attempts, a.two_factor_enrollment_digest, "
+        "a.two_factor_enrollment_expires, a.two_factor_enrollment_workspace, "
+        "a.two_factor_enrollment_attempts RETURN a.id AS id",
+        id=account_id,
+        password_hash=password_hash,
+        now=time.time(),
+        database_=database,
+    )
+    return bool(rows)
+
+
+async def delete_account_identity(
+    driver: AsyncDriver, database: str, user_id: str
+) -> None:
+    await ensure_account_schema(driver, database)
+    await driver.execute_query(
+        "MERGE (revoked:RevokedIdentity {id: $id}) SET revoked.deleted_at = $now",
+        id=user_id,
+        now=time.time(),
+        database_=database,
+    )
+    for label in ("Account", "AccountProfile", "PendingSignup"):
+        await driver.execute_query(
+            f"MATCH (n:{label} {{id: $id}}) DETACH DELETE n",
+            id=user_id,
+            database_=database,
+        )
+
+
+async def is_identity_revoked(
+    driver: AsyncDriver, database: str, user_id: str
+) -> bool:
+    rows, _, _ = await driver.execute_query(
+        "MATCH (r:RevokedIdentity {id: $id}) RETURN r.id AS id LIMIT 1",
+        id=user_id,
+        database_=database,
+    )
+    return bool(rows)
+
+
+async def clear_identity_revocation(
+    driver: AsyncDriver, database: str, user_id: str
+) -> None:
+    await driver.execute_query(
+        "MATCH (r:RevokedIdentity {id: $id}) DETACH DELETE r",
+        id=user_id,
+        database_=database,
+    )
 
 
 async def create_pending_signup_if_absent(
@@ -302,6 +387,13 @@ async def clear_expired_account_challenges(
         "a.two_factor_enrollment_digest, a.two_factor_enrollment_expires, "
         "a.two_factor_enrollment_workspace, a.two_factor_enrollment_attempts",
         now=now,
+        database_=database,
+    )
+    await driver.execute_query(
+        "MATCH (r:RevokedIdentity) WHERE r.deleted_at <= $now - $retention "
+        "DETACH DELETE r",
+        now=now,
+        retention=14 * 24 * 60 * 60,
         database_=database,
     )
     return expired_signups

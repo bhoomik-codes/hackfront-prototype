@@ -817,14 +817,33 @@ async def delete_expired_repository_graphs(
 async def delete_workspace_repositories(
     driver: AsyncDriver, database: str, workspace_id: str
 ) -> int:
+    deleted = 0
+    while True:
+        rows, _, _ = await driver.execute_query(
+            "MATCH (r:Repository) WHERE r.repository_id STARTS WITH $prefix "
+            "AND coalesce(r.is_saved, false) = false "
+            "RETURN r.id AS id LIMIT 100",
+            prefix=f"{workspace_id}:github.com/",
+            database_=database,
+        )
+        repository_ids = [str(row["id"]) for row in rows]
+        for repository_id in repository_ids:
+            await delete_repository_graph(driver, database, repository_id)
+        deleted += len(repository_ids)
+        if len(repository_ids) < 100:
+            return deleted
+
+
+async def delete_user_saved_repositories(
+    driver: AsyncDriver, database: str, user_id: str
+) -> int:
     rows, _, _ = await driver.execute_query(
-        "MATCH (r:Repository) WHERE r.repository_id STARTS WITH $prefix "
-        "AND coalesce(r.is_saved, false) = false "
-        "RETURN r.id AS id LIMIT 100",
-        prefix=f"{workspace_id}:github.com/",
+        "MATCH (r:Repository) WHERE r.is_saved = true AND r.owner_user_id = $user_id "
+        "RETURN r.id AS id ORDER BY r.indexed_at DESC",
+        user_id=user_id,
         database_=database,
     )
-    repository_ids = [str(row["id"]) for row in rows]
+    repository_ids = [str(row["id"]) for row in rows if row.get("id")]
     for repository_id in repository_ids:
         await delete_repository_graph(driver, database, repository_id)
     return len(repository_ids)

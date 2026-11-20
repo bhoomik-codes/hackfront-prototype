@@ -64,8 +64,18 @@ export const loginWithEmail = (email: string, password: string) => request<{ aut
 export const verifyEmailTwoFactor = (email: string, code: string) => request<{ authenticated: boolean; login: string }>('/api/auth/email/2fa/verify', {
   method: 'POST', body: JSON.stringify({ email, code }),
 })
-export type AccountSettings = { email: string | null; provider: string | null; two_factor_enabled: boolean; two_factor_available: boolean }
+export type AccountSettings = { email: string | null; provider: string | null; username: string; two_factor_enabled: boolean; two_factor_available: boolean }
 export const getAccountSettings = () => request<AccountSettings>('/api/account')
+export const updateAccountProfile = (username: string) => request<{ username: string }>('/api/account/profile', {
+  method: 'PUT', body: JSON.stringify({ username }),
+})
+export const changeAccountPassword = (currentPassword: string, newPassword: string) => request<void>('/api/account/password', {
+  method: 'PUT', body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+})
+export const deleteAccountRepositories = () => request<{ deleted: number }>('/api/account/repositories', { method: 'DELETE' })
+export const deleteAccount = (confirmation: 'DELETE', password?: string) => request<void>('/api/account', {
+  method: 'DELETE', body: JSON.stringify({ confirmation, ...(password ? { password } : {}) }),
+})
 export const updateTwoFactor = (enabled: boolean, password: string) => request<{ two_factor_enabled: boolean; enrollment_required?: boolean }>('/api/account/two-factor', {
   method: 'POST', body: JSON.stringify({ enabled, password }),
 })
