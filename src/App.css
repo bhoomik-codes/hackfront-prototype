@@ -484,3 +484,13 @@ a { color: inherit; text-decoration: none; }
   .code-line { font-size: 8px; }
   .toast { right: 10px; bottom: 10px; left: 10px; max-width: none; }
 }
+
+.notification-stack { position: fixed; z-index: 10000; top: 18px; right: 18px; width: min(430px, calc(100vw - 36px)); display: grid; gap: 10px; max-height: calc(100dvh - 36px); overflow-y: auto; pointer-events: none; }
+.notification { display: flex; align-items: flex-start; gap: 12px; padding: 16px; background: #20251b; color: #e4eadb; border: 1px solid #596742; border-left: 3px solid var(--accent); border-radius: 5px; box-shadow: 0 12px 36px #0007; pointer-events: auto; }
+.notification > svg { flex-shrink: 0; color: var(--accent); }
+.notification strong { font-size: 13px; }
+.notification p { margin: 5px 0 0; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+.notification button { flex-shrink: 0; padding: 5px; margin: -4px -4px 0 auto; background: transparent; color: inherit; }
+.notification button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.notification-error { border-color: #8b6942; border-left-color: #e9b878; background: #29251d; }
+.notification-error > svg { color: #e9b878; }

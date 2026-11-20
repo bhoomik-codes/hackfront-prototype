@@ -1,6 +1,6 @@
 import type { AnalysisJob, ApiHealth, GraphMode, RepositoryGraphData, RepositorySource, RepositorySummary } from '../types'
 
-type ApiErrorPayload = { detail?: { message?: string; code?: string } | string }
+type ApiErrorPayload = { detail?: { message?: string; code?: string } | string | unknown[] }
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? ''
 
 export class RepositoryApiError extends Error {
@@ -25,8 +25,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const data = await response.json().catch(() => null) as T | ApiErrorPayload | null
   if (!response.ok) {
     const detail = (data as ApiErrorPayload | null)?.detail
-    const message = typeof detail === 'object' && detail?.message ? detail.message : typeof detail === 'string' ? detail : `The request failed (${response.status}).`
-    const code = typeof detail === 'object' && detail?.code ? detail.code : 'request_failed'
+    const message = detail && !Array.isArray(detail) && typeof detail === 'object' && detail.message ? detail.message : typeof detail === 'string' ? detail : response.status === 422 ? 'Some details are invalid. Check the fields and try again.' : response.status === 401 ? 'Your session has expired. Sign in again to continue.' : response.status === 403 ? 'You do not have permission for this action.' : response.status === 404 ? 'This item is no longer available. Refresh the list and try again.' : response.status === 429 ? 'Too many requests. Wait a moment before trying again.' : response.status >= 500 ? 'The service is temporarily unavailable. Please try again shortly.' : 'This action could not be completed. Check your details and try again.'
+    const code = detail && !Array.isArray(detail) && typeof detail === 'object' && detail.code ? detail.code : 'request_failed'
     throw new RepositoryApiError(message, code, response.status)
   }
   if (response.status === 204) return undefined as T

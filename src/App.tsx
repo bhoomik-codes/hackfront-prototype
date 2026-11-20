@@ -1,3 +1,5 @@
+import { Notifications } from './Notifications'
+import { reportError } from './notificationsStore'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Core, ElementDefinition } from 'cytoscape'
 import type { GraphMode, RepositoryGraphData, RepositoryGraphNode, RepositorySource, RepositorySummary } from './types'
@@ -5,7 +7,7 @@ import { changeAccountPassword, checkApiHealth, confirmTwoFactorEnrollment, dele
 import { askWithEvidence, testModelConnection, type AssistantSettings, type EvidenceCitation } from './services/evidenceAssistant'
 import {
   ArrowDown, ArrowRight, ArrowsOut, BookOpenText,
-  CheckCircle, CaretDown, ClockCounterClockwise, Code, FileCode, GearSix,
+  CaretDown, ClockCounterClockwise, Code, FileCode, GearSix,
   FolderSimple, GithubLogo, GitCommit, GitPullRequest, Graph,
   GoogleLogo, MagnifyingGlass, PaperPlaneRight, Plus, ShieldCheck, Sparkle, Trash, X,
 } from '@phosphor-icons/react'
@@ -425,7 +427,7 @@ function App() {
         if (active) setSavedRepositories(repositories)
       } catch { /* keep the landing page usable if Aura is not configured */ }
     }).catch((error: unknown) => {
-      if (active) setApiHealth({ ready: false, message: error instanceof Error ? error.message : 'The API is unavailable.' })
+      if (active) setApiHealth({ ready: false, message: reportError(error, 'The API is unavailable.') })
     })
     return () => { active = false }
   }, [])
@@ -479,7 +481,7 @@ function App() {
       const firstNode = graph.nodes.find((node) => node.kind === 'file') ?? graph.nodes[0]
       if (firstNode) setSelectedId((current) => graph.nodes.some((node) => node.id === current) ? current : firstNode.id)
     }).catch((error: unknown) => {
-      if (active) setNotice(error instanceof Error ? error.message : 'The repository graph could not be loaded.')
+      if (active) setNotice(reportError(error, 'The repository graph could not be loaded.'))
     }).finally(() => { if (active) setGraphLoading(false) })
     return () => { active = false }
   }, [repositoryOwner, repositoryName, mode])
@@ -492,7 +494,7 @@ function App() {
     }).catch((error: unknown) => {
       if (active) {
         setCurrentSource(null)
-        setSourceError(error instanceof Error ? error.message : 'This file could not be loaded.')
+        setSourceError(reportError(error, 'This file could not be loaded.'))
       }
     })
     return () => { active = false }
@@ -501,7 +503,7 @@ function App() {
   const handleSubmitRepo = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const normalized = repoUrl.trim()
-    if (!normalized) { setNotice('Paste a public GitHub repository URL to continue.'); return }
+    if (!/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/?$/.test(normalized) || /\/(?:\.|\.\.)(?:\/|$)/.test(normalized)) { setNotice(reportError(null, 'Enter a public repository link like https://github.com/owner/repository. Copy the repository page URL, without extra paths or query parameters.')); return }
     if (!storageConsent) { setNotice('Please confirm that the selected public repository history will be stored in the connected Neo4j database.'); return }
     setNotice('')
     setIsIndexing(true)
@@ -533,7 +535,7 @@ function App() {
       setSelectedId('')
       setNotice('')
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'Repository indexing failed. Please try again.')
+      setNotice(reportError(error, 'Repository indexing failed. Please try again.'))
     } finally {
       setIsIndexing(false)
     }
@@ -612,7 +614,7 @@ function App() {
       setAuthCode('')
       setAuthMessage(result.message)
     } catch (error) {
-      setAuthMessage(error instanceof Error ? error.message : 'Email signup could not be started.')
+      setAuthMessage(reportError(error, 'Email signup could not be started.'))
     } finally { setAuthBusy(false) }
   }
 
@@ -629,7 +631,7 @@ function App() {
         completeEmailSignIn(session.login)
       }
     } catch (error) {
-      setAuthMessage(error instanceof Error ? error.message : 'Email sign-in failed.')
+      setAuthMessage(reportError(error, 'Email sign-in failed.'))
     } finally { setAuthBusy(false) }
   }
 
@@ -642,7 +644,7 @@ function App() {
         : await verifyEmailTwoFactor(authEmail.trim(), authCode.trim())
       completeEmailSignIn(session.login)
     } catch (error) {
-      setAuthMessage(error instanceof Error ? error.message : 'That code could not be verified.')
+      setAuthMessage(reportError(error, 'That code could not be verified.'))
     } finally { setAuthBusy(false) }
   }
 
@@ -670,7 +672,7 @@ function App() {
         setAccountMessage('Your profile is ready, but the repository list could not be loaded. Try again shortly.')
       }
     } catch (error) {
-      setAccountMessage(error instanceof Error ? error.message : 'Account settings could not be loaded.')
+      setAccountMessage(reportError(error, 'Account settings could not be loaded.'))
     } finally { setAccountBusy(false) }
   }
 
@@ -684,7 +686,7 @@ function App() {
       setProfileUsername(result.username)
       setAccountMessage('Your display name has been updated.')
     } catch (error) {
-      setAccountMessage(error instanceof Error ? error.message : 'Your profile could not be updated.')
+      setAccountMessage(reportError(error, 'Your profile could not be updated.'))
     } finally { setAccountBusy(false) }
   }
 
@@ -698,7 +700,7 @@ function App() {
       setNewAccountPassword('')
       setAccountMessage('Your password has been changed.')
     } catch (error) {
-      setAccountMessage(error instanceof Error ? error.message : 'Your password could not be changed.')
+      setAccountMessage(reportError(error, 'Your password could not be changed.'))
     } finally { setAccountBusy(false) }
   }
 
@@ -722,7 +724,7 @@ function App() {
       if (activeRepository?.fullName === repository.full_name) resetActiveRepositoryView()
       setAccountMessage(`${repository.full_name} was removed from your saved indexes.`)
     } catch (error) {
-      setAccountMessage(error instanceof Error ? error.message : 'The repository index could not be deleted.')
+      setAccountMessage(reportError(error, 'The repository index could not be deleted.'))
     } finally { setAccountBusy(false) }
   }
 
@@ -738,7 +740,7 @@ function App() {
       setShowAccountSettings(false)
       setNotice(`Deleted ${result.deleted} repository index${result.deleted === 1 ? '' : 'es'}.`)
     } catch (error) {
-      setAccountMessage(error instanceof Error ? error.message : 'Repository indexes could not be deleted.')
+      setAccountMessage(reportError(error, 'Repository indexes could not be deleted.'))
     } finally { setAccountBusy(false) }
   }
 
@@ -757,7 +759,7 @@ function App() {
       resetActiveRepositoryView()
       setNotice('Your account and its repository indexes have been deleted.')
     } catch (error) {
-      setAccountMessage(error instanceof Error ? error.message : 'Your account could not be deleted.')
+      setAccountMessage(reportError(error, 'Your account could not be deleted.'))
     } finally { setAccountBusy(false) }
   }
 
@@ -779,7 +781,7 @@ function App() {
         setAccountMessage('Email two-step verification is disabled.')
       }
     } catch (error) {
-      setAccountMessage(error instanceof Error ? error.message : 'The security setting could not be updated.')
+      setAccountMessage(reportError(error, 'The security setting could not be updated.'))
     } finally { setAccountBusy(false) }
   }
 
@@ -793,7 +795,7 @@ function App() {
       setTwoFactorCode('')
       setAccountMessage('Email two-step verification is enabled.')
     } catch (error) {
-      setAccountMessage(error instanceof Error ? error.message : 'The setup code could not be verified.')
+      setAccountMessage(reportError(error, 'The setup code could not be verified.'))
     } finally { setAccountBusy(false) }
   }
 
@@ -806,7 +808,7 @@ function App() {
       setSavedRepositories(await getRepositories())
       setNotice(`${activeRepository.fullName} is saved to your account.`)
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'This index could not be saved.')
+      setNotice(reportError(error, 'This index could not be saved.'))
     }
   }
 
@@ -824,7 +826,7 @@ function App() {
       setCurrentSource(null)
       setNotice('Signed out. Your saved indexes remain private to your account.')
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'Sign-out failed.')
+      setNotice(reportError(error, 'Sign-out failed.'))
     }
   }
 
@@ -835,7 +837,7 @@ function App() {
       const result = await testModelConnection(assistantSettings)
       setProviderTestMessage(result)
     } catch (error) {
-      setProviderTestMessage(error instanceof Error ? error.message : 'The provider connection could not be tested.')
+      setProviderTestMessage(reportError(error, 'The provider connection could not be tested.'))
     } finally { setProviderTestBusy(false) }
   }
 
@@ -857,7 +859,7 @@ function App() {
         const answer = await askWithEvidence(assistantSettings, text, evidenceGraph, selected.id, relevantSource)
         setChat((current) => [...current, { role: 'assistant', text: answer.answer, citations: answer.citations, confidence: answer.confidence }])
       } catch (error) {
-        setChat((current) => [...current, { role: 'assistant', text: error instanceof Error ? error.message : 'The assistant could not complete this request.' }])
+        setChat((current) => [...current, { role: 'assistant', text: reportError(error, 'The assistant could not complete this request.') }])
       } finally { setAssistantBusy(false) }
       return
     }
@@ -893,7 +895,7 @@ function App() {
       setCurrentSource(null)
       setNotice('Repository graph removed from the connected Neo4j database.')
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'The repository graph could not be removed.')
+      setNotice(reportError(error, 'The repository graph could not be removed.'))
     }
   }
 
@@ -1032,7 +1034,7 @@ function App() {
           {editorOpen && <section className="editor-overlay" aria-label="Unsaved file editor"><header className="editor-header"><div><span>LOCAL DRAFT · READ ONLY SOURCE</span><b>{selected?.path}</b></div><div><span>{editorText.split('\n').length.toLocaleString()} lines{currentSource?.truncated ? ' · fetched file is truncated at the safety limit' : ''}</span><button onClick={() => setEditorPath(null)} aria-label="Close editor"><X size={16} /></button></div></header><div className="editor-body"><div className="editor-column"><pre className="editor-gutter" aria-hidden="true" style={{ transform: `translateY(-${editorScrollTop}px)` }}>{editorText.split('\n').map((_, index) => index + 1).join('\n')}</pre><textarea className="source-editor" aria-label="Editable local source draft" value={editorText} onChange={(event) => setEditorDraft({ path: selected?.path ?? '', content: event.target.value })} onScroll={(event) => setEditorScrollTop(event.currentTarget.scrollTop)} onKeyDown={(event) => { if (event.key === 'Escape') setEditorPath(null); if (event.key === 'Tab') { event.preventDefault(); const input = event.currentTarget; input.setRangeText('    ', input.selectionStart, input.selectionEnd, 'end'); setEditorDraft({ path: selected?.path ?? '', content: input.value }) } }} spellCheck={false} autoCapitalize="off" autoComplete="off" autoCorrect="off" wrap="off" /></div><aside className="editor-impact"><span className="editor-eyebrow">CHANGE PREVIEW</span><h3>{editorDirty ? 'Unsaved draft changes' : 'No draft changes yet'}</h3><div className="draft-diff"><span><b>+{editorChanges.added}</b> approx. lines added</span><span><b>−{editorChanges.removed}</b> approx. lines removed</span></div><p>This is a local draft. Nothing is written to GitHub, Neo4j, or run by this app. The links below are known graph connections, not a runtime prediction.</p>{currentSource?.truncated && <p className="editor-warning">Only the first part of this large file was fetched. The draft cannot represent its unseen remainder.</p>}<button className="editor-ask" disabled={!editorDirty} onClick={() => { setQuestion('What could this unsaved code change affect? Explain only what the draft and connected repository evidence support.'); setActiveSource('assistant'); setEditorPath(null) }}><Sparkle size={14} /> Ask AI about this draft</button><p className="editor-consent-note">The assistant receives up to 8,000 characters of the draft only after you enable provider sharing and send your question.</p><h4>Known graph connections · {connectedNodes.length}</h4>{connectedNodes.length ? connectedNodes.slice(0, 12).map((node) => <div className="editor-impact-node" key={node.id}><span>{node.kind.toUpperCase()}</span><b>{node.label}</b></div>) : <div className="source-state">No related nodes are present in this graph view.</div>}<button className="editor-reset" disabled={!editorDirty} onClick={() => setEditorDraft(null)}>Reset to indexed source</button></aside></div></section>}
         </div>
       </section>}
-      {notice && workspace && <div className="toast" role="status"><CheckCircle size={16} />{notice}<button aria-label="Dismiss notification" onClick={() => setNotice('')}><X size={14} /></button></div>}
+      <Notifications notice={notice} />
       {showAuth && <div className="auth-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowAuth(false) }}>
         <section className="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
           <button className="auth-close" aria-label="Close sign in" onClick={() => setShowAuth(false)}><X size={17} /></button>
