@@ -494,3 +494,8 @@ a { color: inherit; text-decoration: none; }
 .notification button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .notification-error { border-color: #8b6942; border-left-color: #e9b878; background: #29251d; }
 .notification-error > svg { color: #e9b878; }
+
+.guide-dialog { max-width: 580px; max-height: min(85dvh, 760px); overflow-y: auto; }
+.guide-dialog ol { padding-left: 22px; margin: 20px 0; display: grid; gap: 13px; color: #c4ceb8; line-height: 1.55; }
+.guide-dialog li::marker { color: var(--accent); }
+.guide-dialog b { color: #e5edcf; }

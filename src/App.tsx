@@ -106,7 +106,7 @@ const nodeColors: Record<string, string> = {
 function toDisplayNodes(mode: GraphMode, graphData: RepositoryGraphData | null): GraphNode[] {
   return graphData?.nodes.map((node: RepositoryGraphNode) => ({
     ...node,
-    kind: node.kind === 'repository' ? 'root' : node.kind === 'pull_request' ? 'pr' : node.kind,
+    kind: node.kind === 'repository' ? 'root' : node.kind === 'module' ? 'directory' : node.kind === 'pull_request' ? 'pr' : node.kind,
     description: node.description ?? '',
     date: typeof node.metadata.date === 'string' ? node.metadata.date : typeof node.metadata.updated_at === 'string' ? node.metadata.updated_at : undefined,
     author: typeof node.metadata.author === 'string' ? node.metadata.author : typeof node.metadata.login === 'string' ? node.metadata.login : undefined,
@@ -124,7 +124,7 @@ function makeElements(mode: GraphMode, search: string, graphData: RepositoryGrap
         if (node.kind === 'root') return false
         if (!node.path || !['directory', 'file'].includes(node.kind)) return false
         if (scopePath) return parentPath(node.path) === scopePath
-        return node.kind === 'directory' && parentPath(node.path).split('/').filter(Boolean).length === 0
+        return parentPath(node.path) === ''
       })
       const scopeNode = scopePath ? directories.find((node) => node.path === scopePath) : allNodes.find((node) => node.kind === 'root')
       const counts = new Map<string, number>()
@@ -298,6 +298,7 @@ function App() {
   const [showInspector, setShowInspector] = useState(true)
   const [selectedId, setSelectedId] = useState('routefn')
   const [graphScopePath, setGraphScopePath] = useState('')
+  const [showGuide, setShowGuide] = useState(() => { try { return localStorage.getItem('why-guide-seen') !== 'yes' } catch { return true } })
   const [repoUrl, setRepoUrl] = useState('')
   const [storageConsent, setStorageConsent] = useState(false)
   const [workspace, setWorkspace] = useState(false)
@@ -995,7 +996,7 @@ function App() {
               <button className="graph-action" aria-label="Fit graph to screen" onClick={() => document.querySelector('.graph-canvas')?.dispatchEvent(new Event('fitgraph'))}><ArrowsOut size={17} /></button>
             </div>
             <div className="graph-toolbar"><div className="view-switch" role="tablist" aria-label="Graph view"><button role="tab" aria-selected={mode === 'architecture'} className={mode === 'architecture' ? 'active' : ''} onClick={() => switchGraphMode('architecture')}><Graph size={15} /> Code map</button><button role="tab" aria-selected={mode === 'decisions'} className={mode === 'decisions' ? 'active' : ''} onClick={() => switchGraphMode('decisions')}><ClockCounterClockwise size={15} /> Decision map</button></div><label className="graph-search"><MagnifyingGlass size={15} /><input aria-label="Search graph" placeholder="Find file or symbol" value={query} onChange={(event) => setQuery(event.target.value)} /><kbd>⌘ K</kbd></label><div className="filter-wrap"><button className="filter-button" aria-expanded={showGraphFilters} onClick={() => setShowGraphFilters((open) => !open)}><span className="filter-dots"><i /><i /><i /></span> Filters <ArrowDown size={13} /></button>{showGraphFilters && <div className="filter-menu" role="group" aria-label="Filter graph node types">{[['file','Files'],['module','Modules'],['symbol','Symbols'],['commit','Commits'],['pr','Pull requests'],['issue','Issues'],['person','People'],['decision','Decisions']].map(([kind,label]) => <label key={kind}><input type="checkbox" checked={!graphFilters || graphFilters.includes(kind)} onChange={(event) => setGraphFilters((current) => { const allKinds = ['file','module','symbol','commit','pr','issue','person','decision']; const selected = current ? [...current] : allKinds; const next = event.target.checked ? [...selected, kind].filter((item, index, list) => list.indexOf(item) === index) : selected.filter((item) => item !== kind); return next.length === allKinds.length ? null : next })} /> {label}</label>)}<button type="button" onClick={() => { setGraphFilters(null); setShowGraphFilters(false) }}>Reset filters</button></div>}</div></div>
-            {activeRepository && mode === 'architecture' && liveGraph && <nav className="graph-scope-nav" aria-label="Code map location"><button className={!graphScopePath ? 'active' : ''} onClick={() => setGraphScopePath('')}>Repository overview</button>{graphScopePath && graphScopePath.split('/').map((_, index, segments) => { const path = segments.slice(0, index + 1).join('/'); return <span key={path}><span className="scope-separator">/</span><button className={index === segments.length - 1 ? 'active' : ''} onClick={() => setGraphScopePath(path)}>{segments[index]}</button></span> })}<span className="scope-hint">Select a folder to explore its files</span></nav>}
+            {activeRepository && mode === 'architecture' && liveGraph && <nav className="graph-scope-nav" aria-label="Code map location"><button className={!graphScopePath ? 'active' : ''} onClick={() => setGraphScopePath('')}>Repository overview</button>{graphScopePath && graphScopePath.split('/').map((_, index, segments) => { const path = segments.slice(0, index + 1).join('/'); return <span key={path}><span className="scope-separator">/</span><button className={index === segments.length - 1 ? 'active' : ''} onClick={() => setGraphScopePath(path)}>{segments[index]}</button></span> })}<span className="scope-hint">{liveGraph.nodes.filter((node) => node.kind === 'module').length} folders · {liveGraph.nodes.filter((node) => node.kind === 'file').length} files in this view</span><button type="button" onClick={() => setShowGuide(true)}>How to use this map</button></nav>}
             <div className="graph-panel">
               <div className="graph-backdrop-label">{mode === 'architecture' ? 'REPOSITORY OVERVIEW' : 'RECENT EVIDENCE'} <span>·</span> {liveGraph ? mode === 'decisions' ? '32 RECORDS · UP TO 8 FILES AND 8 PEOPLE' : `${liveGraph.nodes.length} INDEXED ENTITIES` : mode === 'architecture' ? '10 ENTITIES' : '7 RECORDS'}</div>
               {graphLoading && <div className="graph-loading" role="status"><span className="loading-ring" /> Loading repository graph</div>}
@@ -1035,6 +1036,12 @@ function App() {
         </div>
       </section>}
       <Notifications notice={notice} />
+      {showGuide && workspace && <div className="auth-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) { setShowGuide(false); try { localStorage.setItem('why-guide-seen', 'yes') } catch { /* browser storage may be unavailable */ } } }}>
+        <section className="auth-dialog guide-dialog" role="dialog" aria-modal="true" aria-labelledby="guide-title"><button className="auth-close" aria-label="Close guide" onClick={() => { setShowGuide(false); try { localStorage.setItem('why-guide-seen', 'yes') } catch { /* browser storage may be unavailable */ } }}><X size={17} /></button>
+          <span className="workspace-kicker">START HERE</span><h2 id="guide-title">Explore your repository</h2><p>These maps show a bounded index of your repository. The number above the canvas counts indexed records; folders and files appear as you browse.</p>
+          <ol><li><b>Code map:</b> Select a folder to see its immediate files and subfolders. Use Repository overview above the canvas to return. Files at the root appear immediately.</li><li><b>Open a file:</b> Select a file node to preview it in the right panel. Open the editor to make a local draft and inspect affected connections.</li><li><b>Decision map:</b> Switch views to see recent commits, pull requests, issues, and their connected evidence.</li><li><b>Search and filters:</b> Search for a path or name; filters narrow the types shown. Fit graph restores the canvas view.</li><li><b>Assistant:</b> Connect your own model in the Assistant tab, then ask why a file or decision exists. Answers use the indexed evidence.</li><li><b>Saving:</b> Temporary indexes expire. Sign in and choose Save index if you want to keep one.</li></ol>
+          <button className="settings-save" onClick={() => { setShowGuide(false); try { localStorage.setItem('why-guide-seen', 'yes') } catch { /* browser storage may be unavailable */ } }}>Explore the map</button>
+        </section></div>}
       {showAuth && <div className="auth-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowAuth(false) }}>
         <section className="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
           <button className="auth-close" aria-label="Close sign in" onClick={() => setShowAuth(false)}><X size={17} /></button>
