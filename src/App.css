@@ -499,3 +499,6 @@ a { color: inherit; text-decoration: none; }
 .guide-dialog ol { padding-left: 22px; margin: 20px 0; display: grid; gap: 13px; color: #c4ceb8; line-height: 1.55; }
 .guide-dialog li::marker { color: var(--accent); }
 .guide-dialog b { color: #e5edcf; }
+
+.assistant-settings select { width: 100%; padding: 8px; border: 1px solid #526445; border-radius: 3px; color: #e3ead7; background: #11140f; font-size: 11px; }
+.provider-key-link { color: var(--accent); font-size: 10px; text-decoration: underline; text-underline-offset: 3px; }
