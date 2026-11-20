@@ -111,10 +111,59 @@ function toDisplayNodes(mode: GraphMode, graphData: RepositoryGraphData | null):
   })) ?? (mode === 'architecture' ? architectureNodes : decisionNodes)
 }
 
-function makeElements(mode: GraphMode, search: string, graphData: RepositoryGraphData | null, filters: string[] | null, positions: Map<string, { x: number; y: number }>): ElementDefinition[] {
-  const sourceNodes = toDisplayNodes(mode, graphData)
+function makeElements(mode: GraphMode, search: string, graphData: RepositoryGraphData | null, filters: string[] | null, positions: Map<string, { x: number; y: number }>, scopePath: string): ElementDefinition[] {
+  const allNodes = toDisplayNodes(mode, graphData)
+  const sourceNodes = mode === 'architecture' && graphData
+    ? (() => {
+      const directories = allNodes.filter((node) => node.kind === 'directory' && node.path)
+      const files = allNodes.filter((node) => node.kind === 'file' && node.path)
+      const parentPath = (path: string) => path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
+      const children = allNodes.filter((node) => {
+        if (node.kind === 'root') return false
+        if (!node.path || !['directory', 'file'].includes(node.kind)) return false
+        if (scopePath) return parentPath(node.path) === scopePath
+        return node.kind === 'directory' && parentPath(node.path).split('/').filter(Boolean).length === 0
+      })
+      const scopeNode = scopePath ? directories.find((node) => node.path === scopePath) : allNodes.find((node) => node.kind === 'root')
+      const counts = new Map<string, number>()
+      for (const node of [...directories, ...files]) {
+        if (!node.path) continue
+        const parent = parentPath(node.path)
+        counts.set(parent, (counts.get(parent) ?? 0) + 1)
+      }
+      const compactChildren = children.map((node, index) => {
+        if (node.kind !== 'directory' || !node.path) return node
+        const count = counts.get(node.path) ?? 0
+        return { ...node, label: `${node.path.split('/').at(-1)}  ·  ${count} items`, x: 170 + (index % 4) * 235, y: 170 + Math.floor(index / 4) * 150 }
+      })
+      const positionedScope = scopeNode ? [{ ...scopeNode, label: scopeNode.kind === 'root' ? scopeNode.label : scopeNode.path?.split('/').at(-1) ?? scopeNode.label, x: 620, y: 85 }] : []
+      return [...positionedScope, ...compactChildren].map((node, index) => node.kind === 'root' || node.id === scopeNode?.id ? node : ({ ...node, x: node.x ?? (150 + (index % 4) * 235), y: node.y ?? (210 + Math.floor(index / 4) * 145) }))
+    })()
+    : mode === 'decisions' && graphData
+      ? (() => {
+        const dateValue = (node: GraphNode) => String(node.date ?? node.metadata?.updated_at ?? node.metadata?.date ?? '')
+        const history = allNodes.filter((node) => node.kind !== 'file' && node.kind !== 'person').sort((a, b) => dateValue(b).localeCompare(dateValue(a))).slice(0, 32)
+        const historyIds = new Set(history.map((node) => node.id))
+        const peopleIds = new Set(graphData.edges.filter((edge) => historyIds.has(edge.source) || historyIds.has(edge.target)).map((edge) => historyIds.has(edge.source) ? edge.target : edge.source))
+        const people = allNodes.filter((node) => node.kind === 'person' && peopleIds.has(node.id)).slice(0, 8)
+        history.push(...people)
+        const connectedFileIds = new Set(graphData.edges.filter((edge) => historyIds.has(edge.source) !== historyIds.has(edge.target)).map((edge) => historyIds.has(edge.source) ? edge.target : edge.source))
+        const files = allNodes.filter((node) => node.kind === 'file' && connectedFileIds.has(node.id)).slice(0, 8)
+        const visible = [...history, ...files]
+        const columns: Record<string, number> = { file: 0, issue: 1, commit: 2, pull_request: 3, pr: 3, comment: 3, decision: 4, person: 5 }
+        const rows = new Map<number, number>()
+        return visible.map((node) => {
+          const column = columns[node.kind] ?? 2
+          const row = rows.get(column) ?? 0
+          rows.set(column, row + 1)
+          return { ...node, x: 110 + column * 180, y: 135 + row * 105 }
+        })
+      })()
+      : allNodes
   const normalizedSearch = search.trim().toLowerCase()
-  const visibleIds = new Set(sourceNodes.filter((node) => (!filters?.length || ['root', 'repository'].includes(node.kind) || filters.includes(node.kind) || (node.kind === 'directory' && filters.includes('module')) || (node.kind === 'pull_request' && filters.includes('pr'))) && (!normalizedSearch || `${node.label} ${node.description} ${node.path ?? ''}`.toLowerCase().includes(normalizedSearch))).map((node) => node.id))
+  const searchableNodes = normalizedSearch && graphData ? allNodes : sourceNodes
+  const visibleIds = new Set(searchableNodes.filter((node) => (!filters?.length || ['root', 'repository'].includes(node.kind) || filters.includes(node.kind) || (node.kind === 'directory' && filters.includes('module')) || (node.kind === 'pull_request' && filters.includes('pr'))) && (!normalizedSearch || `${node.label} ${node.description} ${node.path ?? ''}`.toLowerCase().includes(normalizedSearch))).map((node) => node.id))
+  const elementNodeIds = new Set(searchableNodes.map((node) => node.id))
   const stablePosition = (id: string) => {
     let hash = 2166136261
     for (const character of id) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619)
@@ -122,27 +171,27 @@ function makeElements(mode: GraphMode, search: string, graphData: RepositoryGrap
     const radius = 110 + ((hash >>> 8) % 220)
     return { x: 500 + Math.cos(angle) * radius, y: 320 + Math.sin(angle) * radius }
   }
-  const colors = sourceNodes.map((node) => ({
-    data: { id: node.id, label: node.label, kind: node.kind, color: nodeColors[node.kind] ?? (node.kind.includes('pull') ? nodeColors.pr : nodeColors.file) },
+  const colors = searchableNodes.map((node, index) => ({
+    data: { id: node.id, label: node.kind === 'file' && node.path ? node.path.split('/').at(-1) : node.label, kind: node.kind, color: nodeColors[node.kind] ?? (node.kind.includes('pull') ? nodeColors.pr : nodeColors.file) },
     classes: visibleIds.has(node.id) ? '' : 'filtered-out',
-    position: typeof node.x === 'number' && typeof node.y === 'number' ? { x: node.x, y: node.y } : positions.get(node.id) ?? stablePosition(node.id),
+    position: typeof node.x === 'number' && typeof node.y === 'number' ? { x: node.x, y: node.y } : positions.get(node.id) ?? (graphData ? { x: 160 + (index % 4) * 235, y: 210 + Math.floor(index / 4) * 145 } : stablePosition(node.id)),
   }))
   const edges = graphData
-    ? graphData.edges.map((edge) => ({ data: { id: edge.id, source: edge.source, target: edge.target, kind: edge.kind, label: edge.kind === 'SUPERSEDES' ? 'explicitly supersedes' : edge.label }, classes: visibleIds.has(edge.source) && visibleIds.has(edge.target) ? '' : 'filtered-out' }))
-    : graphEdges[mode].map(([source, target, label], index) => ({ data: { id: `${source}-${target}-${index}`, source, target, label }, classes: visibleIds.has(source) && visibleIds.has(target) ? '' : 'filtered-out' }))
+    ? graphData.edges.filter((edge) => elementNodeIds.has(edge.source) && elementNodeIds.has(edge.target) && (mode !== 'architecture' || (scopePath ? true : edge.kind === 'CONTAINS'))).map((edge) => ({ data: { id: edge.id, source: edge.source, target: edge.target, kind: edge.kind, label: edge.kind === 'SUPERSEDES' ? 'explicitly supersedes' : '' }, classes: visibleIds.has(edge.source) && visibleIds.has(edge.target) ? '' : 'filtered-out' }))
+    : graphEdges[mode].map(([source, target, label], index) => ({ data: { id: `${source}-${target}-${index}`, source, target, label: mode === 'architecture' ? '' : label }, classes: visibleIds.has(source) && visibleIds.has(target) ? '' : 'filtered-out' }))
   return [
     ...colors,
     ...edges,
   ]
 }
 
-function GraphCanvas({ mode, query, graphData, onSelect, selectedId, filters, onZoom }: { mode: GraphMode; query: string; graphData: RepositoryGraphData | null; onSelect: (id: string) => void; selectedId: string; filters: string[] | null; onZoom: (zoom: number) => void }) {
+function GraphCanvas({ mode, query, graphData, onSelect, selectedId, filters, onZoom, scopePath }: { mode: GraphMode; query: string; graphData: RepositoryGraphData | null; onSelect: (id: string) => void; selectedId: string; filters: string[] | null; onZoom: (zoom: number) => void; scopePath: string }) {
   const host = useRef<HTMLDivElement>(null)
   const graph = useRef<Core | null>(null)
   const positions = useRef(new Map<string, { x: number; y: number }>())
-  const didInitialLayout = useRef(false)
-  const propsRef = useRef({ mode, query, graphData, filters, onSelect, onZoom })
-  useEffect(() => { propsRef.current = { mode, query, graphData, filters, onSelect, onZoom } }, [mode, query, graphData, filters, onSelect, onZoom])
+  const lastFitState = useRef({ mode, graphData, scopePath })
+  const propsRef = useRef({ mode, query, graphData, filters, onSelect, onZoom, scopePath })
+  useEffect(() => { propsRef.current = { mode, query, graphData, filters, onSelect, onZoom, scopePath } }, [mode, query, graphData, filters, onSelect, onZoom, scopePath])
   const [graphInstanceVersion, setGraphInstanceVersion] = useState(0)
   const [loadError, setLoadError] = useState(false)
 
@@ -160,7 +209,7 @@ function GraphCanvas({ mode, query, graphData, onSelect, selectedId, filters, on
       const current = propsRef.current
       instance = cytoscape({
         container,
-        elements: makeElements(current.mode, current.query, current.graphData, current.filters, positions.current),
+        elements: makeElements(current.mode, current.query, current.graphData, current.filters, positions.current, current.scopePath),
         layout: { name: 'preset', fit: true, padding: 64 },
         minZoom: 0.35, maxZoom: 2.1,
         style: [
@@ -178,7 +227,6 @@ function GraphCanvas({ mode, query, graphData, onSelect, selectedId, filters, on
         ],
       })
       graph.current = instance
-      didInitialLayout.current = !current.graphData
       setGraphInstanceVersion((version) => version + 1)
       current.onZoom(Math.round(instance.zoom() * 100))
       instance.on('zoom', () => current.onZoom(Math.round((instance?.zoom() ?? 1) * 100)))
@@ -201,10 +249,8 @@ function GraphCanvas({ mode, query, graphData, onSelect, selectedId, filters, on
   useEffect(() => {
     const instance = graph.current
     if (!instance) return
-    const positionCacheForLayout = positions.current
-    const desired = makeElements(mode, query, graphData, filters, positions.current)
+    const desired = makeElements(mode, query, graphData, filters, positions.current, scopePath)
     const desiredById = new Map(desired.map((element) => [String(element.data?.id), element]))
-    let addedNodeCount = 0
     instance.batch(() => {
       instance.edges().forEach((edge) => { if (!desiredById.has(edge.id())) edge.remove() })
       instance.nodes().forEach((node) => {
@@ -220,18 +266,17 @@ function GraphCanvas({ mode, query, graphData, onSelect, selectedId, filters, on
         if (existing.length) {
           existing.data(element.data ?? {})
           existing.classes(element.classes ?? '')
+          if (graphData && element.position) existing.position(element.position)
         } else {
           instance.add(element)
-          if (element.data && !('source' in element.data)) addedNodeCount += 1
         }
       }
     })
-    if (graphData && addedNodeCount && !didInitialLayout.current) {
-      didInitialLayout.current = true
-      instance.layout({ name: 'cose', fit: true, padding: 64, animate: false, randomize: false }).run()
-      instance.nodes().forEach((node) => { positionCacheForLayout.set(node.id(), node.position()) })
+    if (graphData && (lastFitState.current.mode !== mode || lastFitState.current.graphData !== graphData || lastFitState.current.scopePath !== scopePath)) {
+      instance.fit(undefined, 64)
+      lastFitState.current = { mode, graphData, scopePath }
     }
-  }, [mode, query, graphData, filters, graphInstanceVersion])
+  }, [mode, query, graphData, filters, scopePath, graphInstanceVersion])
 
   useEffect(() => {
     if (!graph.current) return
@@ -250,6 +295,7 @@ function App() {
   const [showGraphFilters, setShowGraphFilters] = useState(false)
   const [showInspector, setShowInspector] = useState(true)
   const [selectedId, setSelectedId] = useState('routefn')
+  const [graphScopePath, setGraphScopePath] = useState('')
   const [repoUrl, setRepoUrl] = useState('')
   const [storageConsent, setStorageConsent] = useState(false)
   const [workspace, setWorkspace] = useState(false)
@@ -328,6 +374,12 @@ function App() {
     setEditorPath(null)
     setEditorDraft(null)
   }, [])
+  const handleGraphSelect = (id: string) => {
+    const node = nodes.find((candidate) => candidate.id === id)
+    if (mode === 'architecture' && node?.kind === 'directory' && node.path) setGraphScopePath(node.path)
+    else if (mode === 'architecture' && node?.kind === 'root') setGraphScopePath('')
+    selectNode(id)
+  }
 
   useEffect(() => {
     let active = true
@@ -693,6 +745,7 @@ function App() {
   const switchGraphMode = (nextMode: GraphMode) => {
     if (nextMode === mode) return
     if (activeRepository) setGraphLoading(true)
+    setGraphScopePath('')
     setMode(nextMode)
   }
 
@@ -807,10 +860,11 @@ function App() {
               <button className="graph-action" aria-label="Fit graph to screen" onClick={() => document.querySelector('.graph-canvas')?.dispatchEvent(new Event('fitgraph'))}><ArrowsOut size={17} /></button>
             </div>
             <div className="graph-toolbar"><div className="view-switch" role="tablist" aria-label="Graph view"><button role="tab" aria-selected={mode === 'architecture'} className={mode === 'architecture' ? 'active' : ''} onClick={() => switchGraphMode('architecture')}><Graph size={15} /> Code map</button><button role="tab" aria-selected={mode === 'decisions'} className={mode === 'decisions' ? 'active' : ''} onClick={() => switchGraphMode('decisions')}><ClockCounterClockwise size={15} /> Decision map</button></div><label className="graph-search"><MagnifyingGlass size={15} /><input aria-label="Search graph" placeholder="Find file or symbol" value={query} onChange={(event) => setQuery(event.target.value)} /><kbd>⌘ K</kbd></label><div className="filter-wrap"><button className="filter-button" aria-expanded={showGraphFilters} onClick={() => setShowGraphFilters((open) => !open)}><span className="filter-dots"><i /><i /><i /></span> Filters <ArrowDown size={13} /></button>{showGraphFilters && <div className="filter-menu" role="group" aria-label="Filter graph node types">{[['file','Files'],['module','Modules'],['symbol','Symbols'],['commit','Commits'],['pr','Pull requests'],['issue','Issues'],['person','People'],['decision','Decisions']].map(([kind,label]) => <label key={kind}><input type="checkbox" checked={!graphFilters || graphFilters.includes(kind)} onChange={(event) => setGraphFilters((current) => { const allKinds = ['file','module','symbol','commit','pr','issue','person','decision']; const selected = current ? [...current] : allKinds; const next = event.target.checked ? [...selected, kind].filter((item, index, list) => list.indexOf(item) === index) : selected.filter((item) => item !== kind); return next.length === allKinds.length ? null : next })} /> {label}</label>)}<button type="button" onClick={() => { setGraphFilters(null); setShowGraphFilters(false) }}>Reset filters</button></div>}</div></div>
+            {activeRepository && mode === 'architecture' && liveGraph && <nav className="graph-scope-nav" aria-label="Code map location"><button className={!graphScopePath ? 'active' : ''} onClick={() => setGraphScopePath('')}>Repository overview</button>{graphScopePath && graphScopePath.split('/').map((_, index, segments) => { const path = segments.slice(0, index + 1).join('/'); return <span key={path}><span className="scope-separator">/</span><button className={index === segments.length - 1 ? 'active' : ''} onClick={() => setGraphScopePath(path)}>{segments[index]}</button></span> })}<span className="scope-hint">Select a folder to explore its files</span></nav>}
             <div className="graph-panel">
-              <div className="graph-backdrop-label">{mode === 'architecture' ? 'DEPENDENCY OVERVIEW' : 'EVIDENCE CHAIN'} <span>·</span> {liveGraph ? `${liveGraph.nodes.length} ENTITIES` : mode === 'architecture' ? '10 ENTITIES' : '7 RECORDS'}</div>
+              <div className="graph-backdrop-label">{mode === 'architecture' ? 'REPOSITORY OVERVIEW' : 'RECENT EVIDENCE'} <span>·</span> {liveGraph ? mode === 'decisions' ? '32 RECORDS · UP TO 8 FILES AND 8 PEOPLE' : `${liveGraph.nodes.length} INDEXED ENTITIES` : mode === 'architecture' ? '10 ENTITIES' : '7 RECORDS'}</div>
               {graphLoading && <div className="graph-loading" role="status"><span className="loading-ring" /> Loading repository graph</div>}
-              <GraphCanvas mode={mode} query={query} graphData={liveGraph} onSelect={selectNode} selectedId={selectedId} filters={graphFilters} onZoom={setGraphZoom} />
+              <GraphCanvas mode={mode} query={query} graphData={liveGraph} onSelect={handleGraphSelect} selectedId={selectedId} filters={graphFilters} onZoom={setGraphZoom} scopePath={graphScopePath} />
               <div className="graph-legend"><span><i className="legend-module" /> Module</span><span><i className="legend-file" /> File</span><span><i className="legend-symbol" /> Symbol</span></div>
               <button className="graph-expand" aria-label="Fit graph" onClick={() => { const instance = document.querySelector('.graph-canvas'); instance?.dispatchEvent(new Event('fitgraph')) }}><ArrowsOut size={16} /></button>
               <div className="graph-zoom"><button aria-label="Zoom in" onClick={() => document.querySelector('.graph-canvas')?.dispatchEvent(new Event('zoom-in'))}>+</button><span>{graphZoom}%</span><button aria-label="Zoom out" onClick={() => document.querySelector('.graph-canvas')?.dispatchEvent(new Event('zoom-out'))}>−</button></div>

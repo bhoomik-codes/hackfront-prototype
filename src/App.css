@@ -170,6 +170,12 @@ a { color: inherit; text-decoration: none; }
 .workspace-heading h2 { margin: 9px 0 0; color: #e9ebe4; font: 500 19px/1.3 'Manrope', sans-serif; letter-spacing: -.045em; }
 .graph-action { display: none; color: #939a8d; background: transparent; }
 .graph-toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+.graph-scope-nav { min-height: 28px; display: flex; align-items: center; gap: 7px; margin: -3px 0 9px; color: #7f887b; font-size: 11px; }
+.graph-scope-nav > span:not(.scope-hint) { display: inline-flex; align-items: center; gap: 7px; }
+.graph-scope-nav button { border: 0; background: transparent; padding: 3px 0; color: #a0a899; cursor: pointer; }
+.graph-scope-nav button.active { color: #d2f06c; }
+.scope-separator { color: #52594e; }
+.scope-hint { margin-left: auto; color: #697166; font-size: 10px; }
 .view-switch { display: flex; gap: 2px; padding: 3px; border: 1px solid #2a2e27; border-radius: 5px; background: #171a15; }
 .view-switch button { display: flex; align-items: center; gap: 6px; height: 27px; padding: 0 9px; border-radius: 3px; background: transparent; color: #858c80; font-size: 10px; white-space: nowrap; }
 .view-switch button.active { color: #e3e7dc; background: #2a3024; box-shadow: inset 0 0 0 1px #3a4430; }
