@@ -15,12 +15,24 @@ RAW_GITHUB = "https://raw.githubusercontent.com"
 SOURCE_CACHE_TTL_SECONDS = 300
 SOURCE_CACHE_MAX_ENTRIES = 128
 SOURCE_CHUNK_BYTES = 16_384
-API_CACHE_TTL_SECONDS = 180
+API_CACHE_TTL_SECONDS = 900
 API_CACHE_MAX_ENTRIES = 256
+API_REQUEST_BUDGET = 10
 _API_CACHE: OrderedDict[
     tuple[str, tuple[tuple[str, str], ...]], tuple[float, object]
 ] = OrderedDict()
+_API_IN_FLIGHT: dict[
+    tuple[str, tuple[tuple[str, str], ...]], asyncio.Future[object]
+] = {}
+_API_CACHE_LOCK = asyncio.Lock()
+_API_REQUEST_SEMAPHORE = asyncio.Semaphore(5)
+_API_BUDGET_LOCK = asyncio.Lock()
+_API_ACTIVE_IMPORT_RESERVATIONS = 0
 _API_RATE_LIMITED_UNTIL = 0.0
+_API_RATE_LIMIT_REMAINING: int | None = None
+_API_RATE_LIMIT_RESET_EPOCH = 0
+_API_ANONYMOUS_QUOTA_RESERVE = 10
+_API_AUTHENTICATED_QUOTA_RESERVE = 100
 _SOURCE_CACHE: OrderedDict[
     tuple[str, str, str, str], tuple[float, dict[str, str | bool]]
 ] = OrderedDict()
@@ -78,6 +90,75 @@ class GitHubError(Exception):
         self.code = code
         self.message = message
         self.status_code = status_code
+
+
+def _record_rate_limit_state(headers: httpx.Headers) -> None:
+    global _API_RATE_LIMITED_UNTIL
+    global _API_RATE_LIMIT_REMAINING
+    global _API_RATE_LIMIT_RESET_EPOCH
+    try:
+        remaining = int(headers.get("x-ratelimit-remaining", ""))
+        reset_epoch = int(headers.get("x-ratelimit-reset", ""))
+    except ValueError:
+        return
+    if remaining < 0 or reset_epoch <= 0:
+        return
+    if reset_epoch > _API_RATE_LIMIT_RESET_EPOCH:
+        _API_RATE_LIMIT_REMAINING = remaining
+        _API_RATE_LIMIT_RESET_EPOCH = reset_epoch
+    elif reset_epoch == _API_RATE_LIMIT_RESET_EPOCH:
+        _API_RATE_LIMIT_REMAINING = min(
+            remaining,
+            _API_RATE_LIMIT_REMAINING
+            if _API_RATE_LIMIT_REMAINING is not None
+            else remaining,
+        )
+    if _API_RATE_LIMIT_REMAINING is not None and _API_RATE_LIMIT_REMAINING <= 0:
+        _API_RATE_LIMITED_UNTIL = max(
+            _API_RATE_LIMITED_UNTIL,
+            time.monotonic() + max(60, reset_epoch - int(time.time())),
+        )
+
+
+async def _reserve_api_budget(authenticated: bool) -> None:
+    global _API_ACTIVE_IMPORT_RESERVATIONS
+    async with _API_BUDGET_LOCK:
+        now = time.monotonic()
+        if now < _API_RATE_LIMITED_UNTIL:
+            delay = max(1, int(_API_RATE_LIMITED_UNTIL - now))
+            raise GitHubError(
+                "github_rate_limited",
+                f"GitHub’s shared API budget is cooling down. Try again in about {delay // 60 + 1} minutes.",
+                429,
+            )
+        if (
+            _API_RATE_LIMIT_REMAINING is not None
+            and _API_RATE_LIMIT_RESET_EPOCH > int(time.time())
+        ):
+            available = _API_RATE_LIMIT_REMAINING - (
+                _API_ACTIVE_IMPORT_RESERVATIONS * API_REQUEST_BUDGET
+            )
+            reserve = (
+                _API_AUTHENTICATED_QUOTA_RESERVE
+                if authenticated
+                else _API_ANONYMOUS_QUOTA_RESERVE
+            )
+            if available < API_REQUEST_BUDGET + reserve:
+                delay = max(1, _API_RATE_LIMIT_RESET_EPOCH - int(time.time()))
+                raise GitHubError(
+                    "github_rate_limited",
+                    f"The shared GitHub API budget is being preserved for other users. Try again in about {delay // 60 + 1} minutes.",
+                    429,
+                )
+        _API_ACTIVE_IMPORT_RESERVATIONS += 1
+
+
+async def _release_api_budget() -> None:
+    global _API_ACTIVE_IMPORT_RESERVATIONS
+    async with _API_BUDGET_LOCK:
+        _API_ACTIVE_IMPORT_RESERVATIONS = max(
+            0, _API_ACTIVE_IMPORT_RESERVATIONS - 1
+        )
 
 
 def parse_repository_url(value: str) -> tuple[str, str]:
@@ -238,7 +319,6 @@ class GitHubIndexer:
             timeout=httpx.Timeout(settings.github_api_timeout_seconds),
             follow_redirects=False,
         )
-        self.api_semaphore = asyncio.Semaphore(5)
         self.request_count = 0
 
     async def close(self) -> None:
@@ -253,86 +333,153 @@ class GitHubIndexer:
             endpoint,
             tuple(sorted((str(key), str(value)) for key, value in (params or {}).items())),
         )
-        now = time.monotonic()
-        cached = _API_CACHE.get(cache_key)
-        if cached is not None:
-            expires_at, payload = cached
-            if expires_at > now:
-                _API_CACHE.move_to_end(cache_key)
-                return copy.deepcopy(payload)
-            del _API_CACHE[cache_key]
-        if now < _API_RATE_LIMITED_UNTIL:
-            wait_seconds = max(1, int(_API_RATE_LIMITED_UNTIL - now))
-            raise GitHubError(
-                "github_rate_limited",
-                f"GitHub’s API limit was reached. Try again in about {wait_seconds // 60 + 1} minutes.",
-                429,
-            )
-        self.request_count += 1
-        if self.request_count > 24:
-            raise GitHubError(
-                "github_request_budget",
-                "This import reached its safe GitHub history request limit. Try again later.",
-                429,
-            )
+        async with _API_CACHE_LOCK:
+            cached = _API_CACHE.get(cache_key)
+            if cached is not None:
+                expires_at, payload = cached
+                if expires_at > time.monotonic():
+                    _API_CACHE.move_to_end(cache_key)
+                    return copy.deepcopy(payload)
+                del _API_CACHE[cache_key]
+            in_flight = _API_IN_FLIGHT.get(cache_key)
+            if in_flight is None:
+                if time.monotonic() < _API_RATE_LIMITED_UNTIL:
+                    wait_seconds = max(1, int(_API_RATE_LIMITED_UNTIL - time.monotonic()))
+                    raise GitHubError(
+                        "github_rate_limited",
+                        f"GitHub’s API limit was reached. Try again in about {wait_seconds // 60 + 1} minutes.",
+                        429,
+                    )
+                if self.request_count >= API_REQUEST_BUDGET:
+                    raise GitHubError(
+                        "github_request_budget",
+                        "This import reached its safe GitHub API request budget. Try again later.",
+                        429,
+                    )
+                self.request_count += 1
+                in_flight = asyncio.get_running_loop().create_future()
+                in_flight.add_done_callback(
+                    lambda future: None
+                    if future.cancelled()
+                    else future.exception()
+                )
+                _API_IN_FLIGHT[cache_key] = in_flight
+                is_request_owner = True
+            else:
+                is_request_owner = False
+        if not is_request_owner:
+            return copy.deepcopy(await asyncio.shield(in_flight))
+
+        async def fail_in_flight(error: BaseException) -> None:
+            async with _API_CACHE_LOCK:
+                _API_IN_FLIGHT.pop(cache_key, None)
+                if not in_flight.done():
+                    if isinstance(error, asyncio.CancelledError):
+                        in_flight.cancel()
+                    else:
+                        in_flight.set_exception(error)
+
         try:
-            async with self.api_semaphore:
+            async with _API_REQUEST_SEMAPHORE:
+                if time.monotonic() < _API_RATE_LIMITED_UNTIL:
+                    wait_seconds = max(1, int(_API_RATE_LIMITED_UNTIL - time.monotonic()))
+                    raise GitHubError(
+                        "github_rate_limited",
+                        f"GitHub’s API limit was reached. Try again in about {wait_seconds // 60 + 1} minutes.",
+                        429,
+                    )
                 response = await self.api.get(endpoint, params=params)
+            _record_rate_limit_state(response.headers)
         except httpx.TimeoutException as error:
-            raise GitHubError(
+            failure = GitHubError(
                 "github_timeout",
                 "GitHub did not respond in time. Try again shortly.",
                 504,
-            ) from error
+            )
+            await fail_in_flight(failure)
+            raise failure from error
         except httpx.HTTPError as error:
-            raise GitHubError(
+            failure = GitHubError(
                 "github_unavailable",
                 "GitHub could not be reached. Check the connection and try again.",
                 502,
-            ) from error
-        if response.status_code == 404:
-            raise GitHubError(
-                "repository_not_found", "Repository not found or it is not public.", 404
             )
-        if (
-            response.status_code == 403
-            and response.headers.get("x-ratelimit-remaining") == "0"
-        ):
-            reset_at = response.headers.get("x-ratelimit-reset")
-            try:
-                reset_epoch = int(reset_at) if reset_at else 0
-            except ValueError:
-                reset_epoch = 0
-            delay = max(60, reset_epoch - int(time.time())) if reset_epoch else 3600
-            _API_RATE_LIMITED_UNTIL = time.monotonic() + delay
-            raise GitHubError(
-                "github_rate_limited",
-                f"GitHub’s API limit was reached. Try again in about {delay // 60 + 1} minutes.",
-                429,
+            await fail_in_flight(failure)
+            raise failure from error
+        except BaseException as error:
+            await fail_in_flight(error)
+            raise
+        try:
+            if response.status_code == 404:
+                raise GitHubError(
+                    "repository_not_found", "Repository not found or it is not public.", 404
+                )
+            if (
+                response.status_code == 403
+                and response.headers.get("x-ratelimit-remaining") == "0"
+            ):
+                reset_at = response.headers.get("x-ratelimit-reset")
+                try:
+                    reset_epoch = int(reset_at) if reset_at else 0
+                except ValueError:
+                    reset_epoch = 0
+                delay = max(60, reset_epoch - int(time.time())) if reset_epoch else 3600
+                _API_RATE_LIMITED_UNTIL = max(
+                    _API_RATE_LIMITED_UNTIL, time.monotonic() + delay
+                )
+                raise GitHubError(
+                    "github_rate_limited",
+                    f"GitHub’s API limit was reached. Try again in about {delay // 60 + 1} minutes.",
+                    429,
+                )
+            if response.status_code in {403, 429} and response.headers.get(
+                "retry-after"
+            ):
+                try:
+                    delay = max(1, int(response.headers["retry-after"]))
+                except ValueError:
+                    delay = 60
+                _API_RATE_LIMITED_UNTIL = max(
+                    _API_RATE_LIMITED_UNTIL, time.monotonic() + delay
+                )
+                raise GitHubError(
+                    "github_rate_limited",
+                    f"GitHub temporarily throttled repository imports. Try again in about {delay // 60 + 1} minutes.",
+                    429,
+                )
+            if response.status_code in {401, 403}:
+                raise GitHubError(
+                    "github_access_denied",
+                    "GitHub denied access to this public repository.",
+                    403,
+                )
+            if response.status_code == 429:
+                raise GitHubError(
+                    "github_rate_limited",
+                    "GitHub temporarily limited this import. Try again later.",
+                    429,
+                )
+            if response.status_code >= 400:
+                raise GitHubError(
+                    "github_api_error",
+                    f"GitHub returned an error ({response.status_code}).",
+                    502,
+                )
+            payload = response.json()
+        except BaseException as error:
+            await fail_in_flight(error)
+            raise
+        async with _API_CACHE_LOCK:
+            _API_CACHE[cache_key] = (
+                time.monotonic() + API_CACHE_TTL_SECONDS,
+                payload,
             )
-        if response.status_code in {401, 403}:
-            raise GitHubError(
-                "github_access_denied",
-                "GitHub denied access to this public repository.",
-                403,
-            )
-        if response.status_code == 429:
-            raise GitHubError(
-                "github_rate_limited",
-                "GitHub temporarily limited this import. Try again later.",
-                429,
-            )
-        if response.status_code >= 400:
-            raise GitHubError(
-                "github_api_error",
-                f"GitHub returned an error ({response.status_code}).",
-                502,
-            )
-        payload = response.json()
-        _API_CACHE[cache_key] = (time.monotonic() + API_CACHE_TTL_SECONDS, payload)
-        _API_CACHE.move_to_end(cache_key)
-        while len(_API_CACHE) > API_CACHE_MAX_ENTRIES:
-            _API_CACHE.popitem(last=False)
+            _API_CACHE.move_to_end(cache_key)
+            while len(_API_CACHE) > API_CACHE_MAX_ENTRIES:
+                _API_CACHE.popitem(last=False)
+            _API_IN_FLIGHT.pop(cache_key, None)
+            if not in_flight.done():
+                in_flight.set_result(copy.deepcopy(payload))
         return copy.deepcopy(payload)
 
     async def _raw_file(
@@ -474,6 +621,15 @@ class GitHubIndexer:
     async def collect(
         self, owner: str, repository: str, progress: object
     ) -> dict[str, object]:
+        await _reserve_api_budget(bool(self.settings.github_api_token))
+        try:
+            return await self._collect(owner, repository, progress)
+        finally:
+            await _release_api_budget()
+
+    async def _collect(
+        self, owner: str, repository: str, progress: object
+    ) -> dict[str, object]:
         prefix = f"/repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
         repo_data = await self._get(prefix)
         if not isinstance(repo_data, dict) or repo_data.get("private") is not False:
@@ -574,7 +730,7 @@ class GitHubIndexer:
             self._get(
                 f"{prefix}/commits/{quote(_clean_text(item.get('sha'), 64), safe='')}"
             )
-            for item in commits[:2]
+            for item in commits[:1]
             if _clean_text(item.get("sha"), 64)
         ]
         commit_details = await asyncio.gather(*commit_tasks, return_exceptions=True)
@@ -592,9 +748,9 @@ class GitHubIndexer:
 
         await progress("discussions", 48, "Connecting files to review discussions")
         pull_details_tasks = []
-        # Keep the most useful discussion evidence while staying well below
-        # GitHub's shared anonymous quota on a hosted, multi-user service.
-        for pull in pulls[:3]:
+        # Keep detailed evidence for the latest pull request to limit the
+        # REST calls shared by every user of the hosted service.
+        for pull in pulls[:1]:
             number = pull.get("number")
             if isinstance(number, int) and number > 0:
                 pull_details_tasks.extend(
@@ -624,7 +780,7 @@ class GitHubIndexer:
             if isinstance(item.get("number"), int)
         }
         comment_records: list[dict[str, object]] = []
-        for index, pull in enumerate(pulls[:3]):
+        for index, pull in enumerate(pulls[:1]):
             number = pull.get("number")
             if not isinstance(number, int) or number <= 0:
                 continue
@@ -729,6 +885,6 @@ class GitHubIndexer:
                 "tree_truncated": tree_truncated,
                 "partial_file_index": len(indexed_blobs)
                 >= self.settings.max_indexed_files,
-                "history_window": "metadata for latest 8 commits and pull requests; changed-file details for latest 2 commits and latest 3 pull requests",
+                "history_window": "metadata for latest 8 commits and pull requests; changed-file details for latest commit and latest pull request",
             },
         }
