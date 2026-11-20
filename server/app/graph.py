@@ -691,13 +691,12 @@ async def list_workspace_repositories(
     rows, _, _ = await driver.execute_query(
         "MATCH (r:Repository) WHERE "
         "(r.repository_id STARTS WITH $prefix AND r.expires_at > $now) "
-        "OR ($user_id IS NOT NULL AND r.is_saved = true AND r[$owner_property] = $user_id) "
+        "OR ($user_id IS NOT NULL AND r.is_saved = true AND r.owner_user_id = $user_id) "
         "RETURN r.owner AS owner, r.name AS full_name, r.description AS description, "
         "r.default_branch AS default_branch, r.indexed_at AS indexed_at, r.is_saved AS is_saved "
         "ORDER BY r.indexed_at DESC LIMIT 50",
         prefix=f"{workspace_id}:github.com/",
         user_id=user_id,
-        owner_property="owner_user_id",
         now=datetime.now(UTC).isoformat(),
         database_=database,
     )
@@ -728,7 +727,7 @@ async def touch_repository_graph(
     expires_at = (datetime.now(UTC) + TEMPORARY_GRAPH_TTL).isoformat()
     rows, _, _ = await driver.execute_query(
         "MATCH (r:Repository {id: $id}) WHERE r.expires_at > $now OR "
-        "(r.is_saved = true AND $user_id IS NOT NULL AND r[$owner_property] = $user_id) "
+        "(r.is_saved = true AND $user_id IS NOT NULL AND r.owner_user_id = $user_id) "
         "WITH r, CASE WHEN r.is_saved = true THEN null ELSE $expires_at END AS expiry "
         "SET r.expires_at = expiry "
         "RETURN r.id AS id LIMIT 1",
@@ -736,7 +735,6 @@ async def touch_repository_graph(
         now=datetime.now(UTC).isoformat(),
         expires_at=expires_at,
         user_id=user_id,
-        owner_property="owner_user_id",
         database_=database,
     )
     return bool(rows)
@@ -752,12 +750,11 @@ async def find_accessible_repository_id(
     rows, _, _ = await driver.execute_query(
         "MATCH (r:Repository) WHERE toLower(r.name) = $full_name AND ("
         "(r.repository_id STARTS WITH $prefix AND r.expires_at > $now) OR "
-        "($user_id IS NOT NULL AND r.is_saved = true AND r[$owner_property] = $user_id)) "
+        "($user_id IS NOT NULL AND r.is_saved = true AND r.owner_user_id = $user_id)) "
         "RETURN r.id AS id LIMIT 1",
         full_name=full_name.lower(),
         prefix=f"{workspace_id}:github.com/",
         user_id=user_id,
-        owner_property="owner_user_id",
         now=datetime.now(UTC).isoformat(),
         database_=database,
     )
@@ -768,10 +765,9 @@ async def find_saved_repository_id(
     driver: AsyncDriver, database: str, user_id: str, full_name: str
 ) -> str | None:
     rows, _, _ = await driver.execute_query(
-        "MATCH (r:Repository) WHERE r.is_saved = true AND r[$owner_property] = $user_id "
+        "MATCH (r:Repository) WHERE r.is_saved = true AND r.owner_user_id = $user_id "
         "AND toLower(r.name) = $full_name RETURN r.id AS id LIMIT 1",
         user_id=user_id,
-        owner_property="owner_user_id",
         full_name=full_name.lower(),
         database_=database,
     )

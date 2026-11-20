@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     github_api_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
     max_indexed_files: int = Field(default=1800, ge=100, le=10_000)
     max_source_files: int = Field(default=120, ge=0, le=250)
-    max_source_bytes: int = Field(default=96_000, ge=1_000, le=250_000)
+    max_source_bytes: int = Field(default=250_000, ge=1_000, le=250_000)
     max_source_total_bytes: int = Field(default=8_000_000, ge=100_000, le=20_000_000)
 
     @property

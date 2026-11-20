@@ -1587,7 +1587,7 @@ async def get_repository_file(
             )
         rows, _, _ = await driver.execute_query(
             "MATCH (r:Repository {id: $id}) WHERE r.expires_at > $now OR "
-            "(r.is_saved = true AND $user_id IS NOT NULL AND r[$owner_property] = $user_id) "
+            "(r.is_saved = true AND $user_id IS NOT NULL AND r.owner_user_id = $user_id) "
             "WITH r, CASE WHEN r.is_saved = true THEN null ELSE $expires_at END AS expiry "
             "SET r.expires_at = expiry "
             "RETURN r.default_branch AS branch LIMIT 1",
@@ -1595,7 +1595,6 @@ async def get_repository_file(
             now=datetime.now(UTC).isoformat(),
             expires_at=(datetime.now(UTC) + timedelta(hours=2)).isoformat(),
             user_id=_authenticated_user_id(request),
-            owner_property="owner_user_id",
             database_=settings.neo4j_database,
         )
     except (DriverError, Neo4jError, ExceptionGroup) as error:

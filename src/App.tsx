@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Core, ElementDefinition } from 'cytoscape'
 import type { GraphMode, RepositoryGraphData, RepositoryGraphNode, RepositorySource, RepositorySummary } from './types'
 import { checkApiHealth, confirmTwoFactorEnrollment, deleteRepository, getAccountSettings, getAnalysisJob, getRepositories, getRepositoryFile, getRepositoryGraph, loginWithEmail, loginWithGitHub, loginWithGoogle, logout, registerEmailAccount, RepositoryApiError, saveRepository, startBrowserSession, startRepositoryAnalysis, updateTwoFactor, verifyEmailSignup, verifyEmailTwoFactor, type AccountSettings } from './services/repositoryApi'
-import { askWithEvidence, type AssistantSettings, type EvidenceCitation } from './services/evidenceAssistant'
+import { askWithEvidence, testModelConnection, type AssistantSettings, type EvidenceCitation } from './services/evidenceAssistant'
 import {
   ArrowDown, ArrowRight, ArrowsOut, BookOpenText,
   CheckCircle, CaretDown, ClockCounterClockwise, Code, FileCode, GearSix,
@@ -35,6 +35,16 @@ function citationHref(citation: EvidenceCitation, repository: { owner: string; r
     return `https://github.com/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repository)}/blob/${branch}/${path}`
   }
   return undefined
+}
+
+function changedLineCounts(before: string, after: string) {
+  const original = before.split('\n')
+  const draft = after.split('\n')
+  let prefix = 0
+  while (prefix < original.length && prefix < draft.length && original[prefix] === draft[prefix]) prefix += 1
+  let suffix = 0
+  while (suffix < original.length - prefix && suffix < draft.length - prefix && original[original.length - suffix - 1] === draft[draft.length - suffix - 1]) suffix += 1
+  return { added: draft.length - prefix - suffix, removed: original.length - prefix - suffix }
 }
 
 const architectureNodes: GraphNode[] = [
@@ -101,18 +111,25 @@ function toDisplayNodes(mode: GraphMode, graphData: RepositoryGraphData | null):
   })) ?? (mode === 'architecture' ? architectureNodes : decisionNodes)
 }
 
-function makeElements(mode: GraphMode, search: string, graphData: RepositoryGraphData | null, filters: string[] | null): ElementDefinition[] {
+function makeElements(mode: GraphMode, search: string, graphData: RepositoryGraphData | null, filters: string[] | null, positions: Map<string, { x: number; y: number }>): ElementDefinition[] {
   const sourceNodes = toDisplayNodes(mode, graphData)
   const normalizedSearch = search.trim().toLowerCase()
-  const visible = sourceNodes.filter((node) => (!filters?.length || ['root', 'repository'].includes(node.kind) || filters.includes(node.kind) || (node.kind === 'directory' && filters.includes('module')) || (node.kind === 'pull_request' && filters.includes('pr'))) && (!normalizedSearch || `${node.label} ${node.description} ${node.path ?? ''}`.toLowerCase().includes(normalizedSearch)))
-  const visibleIds = new Set(visible.map((node) => node.id))
-  const colors = visible.map((node) => ({
+  const visibleIds = new Set(sourceNodes.filter((node) => (!filters?.length || ['root', 'repository'].includes(node.kind) || filters.includes(node.kind) || (node.kind === 'directory' && filters.includes('module')) || (node.kind === 'pull_request' && filters.includes('pr'))) && (!normalizedSearch || `${node.label} ${node.description} ${node.path ?? ''}`.toLowerCase().includes(normalizedSearch))).map((node) => node.id))
+  const stablePosition = (id: string) => {
+    let hash = 2166136261
+    for (const character of id) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619)
+    const angle = ((hash >>> 0) % 6283) / 1000
+    const radius = 110 + ((hash >>> 8) % 220)
+    return { x: 500 + Math.cos(angle) * radius, y: 320 + Math.sin(angle) * radius }
+  }
+  const colors = sourceNodes.map((node) => ({
     data: { id: node.id, label: node.label, kind: node.kind, color: nodeColors[node.kind] ?? (node.kind.includes('pull') ? nodeColors.pr : nodeColors.file) },
-    ...(typeof node.x === 'number' && typeof node.y === 'number' ? { position: { x: node.x, y: node.y } } : {}),
+    classes: visibleIds.has(node.id) ? '' : 'filtered-out',
+    position: typeof node.x === 'number' && typeof node.y === 'number' ? { x: node.x, y: node.y } : positions.get(node.id) ?? stablePosition(node.id),
   }))
   const edges = graphData
-    ? graphData.edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target)).map((edge) => ({ data: { id: edge.id, source: edge.source, target: edge.target, kind: edge.kind, label: edge.kind === 'SUPERSEDES' ? 'explicitly supersedes' : edge.label } }))
-    : graphEdges[mode].filter(([from, to]) => visibleIds.has(from) && visibleIds.has(to)).map(([source, target, label], index) => ({ data: { id: `${source}-${target}-${index}`, source, target, label } }))
+    ? graphData.edges.map((edge) => ({ data: { id: edge.id, source: edge.source, target: edge.target, kind: edge.kind, label: edge.kind === 'SUPERSEDES' ? 'explicitly supersedes' : edge.label }, classes: visibleIds.has(edge.source) && visibleIds.has(edge.target) ? '' : 'filtered-out' }))
+    : graphEdges[mode].map(([source, target, label], index) => ({ data: { id: `${source}-${target}-${index}`, source, target, label }, classes: visibleIds.has(source) && visibleIds.has(target) ? '' : 'filtered-out' }))
   return [
     ...colors,
     ...edges,
@@ -122,24 +139,30 @@ function makeElements(mode: GraphMode, search: string, graphData: RepositoryGrap
 function GraphCanvas({ mode, query, graphData, onSelect, selectedId, filters, onZoom }: { mode: GraphMode; query: string; graphData: RepositoryGraphData | null; onSelect: (id: string) => void; selectedId: string; filters: string[] | null; onZoom: (zoom: number) => void }) {
   const host = useRef<HTMLDivElement>(null)
   const graph = useRef<Core | null>(null)
+  const positions = useRef(new Map<string, { x: number; y: number }>())
+  const didInitialLayout = useRef(false)
+  const propsRef = useRef({ mode, query, graphData, filters, onSelect, onZoom })
+  useEffect(() => { propsRef.current = { mode, query, graphData, filters, onSelect, onZoom } }, [mode, query, graphData, filters, onSelect, onZoom])
   const [graphInstanceVersion, setGraphInstanceVersion] = useState(0)
   const [loadError, setLoadError] = useState(false)
 
   useEffect(() => {
     if (!host.current) return
     const container = host.current
+    const positionCache = positions.current
     let instance: Core | null = null
     let cancelled = false
-    let fit: (() => void) | undefined
-    let zoomIn: (() => void) | undefined
-    let zoomOut: (() => void) | undefined
+    const fit = () => graph.current?.fit(undefined, 64)
+    const zoomIn = () => { const instance = graph.current; if (instance) instance.zoom({ level: Math.min(instance.zoom() * 1.2, 2.1), renderedPosition: { x: instance.width() / 2, y: instance.height() / 2 } }) }
+    const zoomOut = () => { const instance = graph.current; if (instance) instance.zoom({ level: Math.max(instance.zoom() / 1.2, 0.35), renderedPosition: { x: instance.width() / 2, y: instance.height() / 2 } }) }
     void import('cytoscape').then(({ default: cytoscape }) => {
       if (cancelled || !host.current) return
+      const current = propsRef.current
       instance = cytoscape({
         container,
-        elements: makeElements(mode, query, graphData, filters),
-        layout: graphData ? { name: 'cose', fit: true, padding: 64, animate: false } : { name: 'preset', fit: true, padding: 64, animate: true, animationDuration: 450 },
-        minZoom: 0.35, maxZoom: 2.1, wheelSensitivity: 0.2,
+        elements: makeElements(current.mode, current.query, current.graphData, current.filters, positions.current),
+        layout: { name: 'preset', fit: true, padding: 64 },
+        minZoom: 0.35, maxZoom: 2.1,
         style: [
           { selector: 'node', style: { 'background-color': 'data(color)', 'label': 'data(label)', 'color': '#e6e9df', 'font-size': '11px', 'font-family': 'Segoe UI, sans-serif', 'font-weight': 500, 'text-wrap': 'wrap', 'text-max-width': '120px', 'text-valign': 'bottom', 'text-margin-y': 11, 'text-outline-width': 2, 'text-outline-color': '#111410', 'width': 25, 'height': 25, 'border-width': 1, 'border-color': '#111410', 'overlay-opacity': 0, 'transition-property': 'width height border-width', 'transition-duration': 180 } },
           { selector: 'node[kind = "root"], node[kind = "decision"]', style: { width: 36, height: 36, 'border-width': 2, 'border-color': '#e7f5bf', 'font-size': '12px' } },
@@ -147,6 +170,7 @@ function GraphCanvas({ mode, query, graphData, onSelect, selectedId, filters, on
           { selector: 'node[kind = "pr"], node[kind = "pull_request"]', style: { 'border-width': 2, 'border-color': '#84aaa0' } },
           { selector: 'node[kind = "commit"]', style: { shape: 'diamond' } },
           { selector: 'node[kind = "issue"]', style: { shape: 'round-tag' } },
+          { selector: '.filtered-out', style: { display: 'none' } },
           { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#d2f06c', 'width': 34, 'height': 34, 'z-index': 999 } },
           { selector: 'edge', style: { 'curve-style': 'bezier', 'line-color': '#40473d', 'target-arrow-color': '#737d6b', 'target-arrow-shape': 'triangle', 'arrow-scale': 0.72, 'width': 1.2, 'label': 'data(label)', 'font-size': '8px', 'color': '#9ca496', 'text-background-color': '#111410', 'text-background-opacity': 0.92, 'text-background-padding': '3px', 'text-rotation': 'autorotate', 'opacity': 0.85 } },
           { selector: 'edge[kind = "SUPERSEDES"]', style: { 'line-color': '#d2f06c', 'target-arrow-color': '#d2f06c', width: 2, color: '#d2f06c', 'font-weight': 700, opacity: 1 } },
@@ -154,26 +178,60 @@ function GraphCanvas({ mode, query, graphData, onSelect, selectedId, filters, on
         ],
       })
       graph.current = instance
+      didInitialLayout.current = !current.graphData
       setGraphInstanceVersion((version) => version + 1)
-      onZoom(Math.round(instance.zoom() * 100))
-      instance.on('zoom', () => onZoom(Math.round((instance?.zoom() ?? 1) * 100)))
-      instance.on('tap', 'node', (event) => onSelect(event.target.id()))
-      fit = () => instance?.fit(undefined, 64)
-      zoomIn = () => instance?.zoom({ level: Math.min(instance.zoom() * 1.2, 2.1), renderedPosition: { x: instance.width() / 2, y: instance.height() / 2 } })
-      zoomOut = () => instance?.zoom({ level: Math.max(instance.zoom() / 1.2, 0.35), renderedPosition: { x: instance.width() / 2, y: instance.height() / 2 } })
+      current.onZoom(Math.round(instance.zoom() * 100))
+      instance.on('zoom', () => current.onZoom(Math.round((instance?.zoom() ?? 1) * 100)))
+      instance.on('tap', 'node', (event) => propsRef.current.onSelect(event.target.id()))
       container.addEventListener('fitgraph', fit)
       container.addEventListener('zoom-in', zoomIn)
       container.addEventListener('zoom-out', zoomOut)
     }).catch(() => { if (!cancelled) setLoadError(true) })
     return () => {
       cancelled = true
-      if (fit) container.removeEventListener('fitgraph', fit)
-      if (zoomIn) container.removeEventListener('zoom-in', zoomIn)
-      if (zoomOut) container.removeEventListener('zoom-out', zoomOut)
+      container.removeEventListener('fitgraph', fit)
+      container.removeEventListener('zoom-in', zoomIn)
+      container.removeEventListener('zoom-out', zoomOut)
+      instance?.nodes().forEach((node) => { if (!node.empty()) positionCache.set(node.id(), node.position()) })
       instance?.destroy()
       if (graph.current === instance) graph.current = null
     }
-  }, [mode, query, graphData, onSelect, filters, onZoom])
+  }, [])
+
+  useEffect(() => {
+    const instance = graph.current
+    if (!instance) return
+    const positionCacheForLayout = positions.current
+    const desired = makeElements(mode, query, graphData, filters, positions.current)
+    const desiredById = new Map(desired.map((element) => [String(element.data?.id), element]))
+    let addedNodeCount = 0
+    instance.batch(() => {
+      instance.edges().forEach((edge) => { if (!desiredById.has(edge.id())) edge.remove() })
+      instance.nodes().forEach((node) => {
+        if (!desiredById.has(node.id())) {
+          positions.current.set(node.id(), node.position())
+          node.remove()
+        }
+      })
+      for (const element of desired) {
+        const id = String(element.data?.id ?? '')
+        if (!id) continue
+        const existing = instance.getElementById(id)
+        if (existing.length) {
+          existing.data(element.data ?? {})
+          existing.classes(element.classes ?? '')
+        } else {
+          instance.add(element)
+          if (element.data && !('source' in element.data)) addedNodeCount += 1
+        }
+      }
+    })
+    if (graphData && addedNodeCount && !didInitialLayout.current) {
+      didInitialLayout.current = true
+      instance.layout({ name: 'cose', fit: true, padding: 64, animate: false, randomize: false }).run()
+      instance.nodes().forEach((node) => { positionCacheForLayout.set(node.id(), node.position()) })
+    }
+  }, [mode, query, graphData, filters, graphInstanceVersion])
 
   useEffect(() => {
     if (!graph.current) return
@@ -222,15 +280,22 @@ function App() {
   const [twoFactorCode, setTwoFactorCode] = useState('')
   const [activeIsSaved, setActiveIsSaved] = useState(false)
   const [liveGraph, setLiveGraph] = useState<RepositoryGraphData | null>(null)
+  const repositoryOwner = activeRepository?.owner
+  const repositoryName = activeRepository?.repository
   const [graphLoading, setGraphLoading] = useState(false)
   const [currentSource, setCurrentSource] = useState<RepositorySource | null>(null)
   const [sourceError, setSourceError] = useState('')
+  const [editorPath, setEditorPath] = useState<string | null>(null)
+  const [editorDraft, setEditorDraft] = useState<{ path: string; content: string } | null>(null)
+  const [editorScrollTop, setEditorScrollTop] = useState(0)
   const [chat, setChat] = useState<ChatMessage[]>([{ role: 'assistant', text: 'Ask about this codebase. I’ll trace the answer back to repository evidence and call out when the history can’t support a conclusion.' }])
   const [question, setQuestion] = useState('')
   const [assistantSettings, setAssistantSettings] = useState<AssistantSettings>(getSavedAssistantSettings)
   const [showAssistantSettings, setShowAssistantSettings] = useState(false)
   const [shareWithProvider, setShareWithProvider] = useState(false)
   const [assistantBusy, setAssistantBusy] = useState(false)
+  const [providerTestBusy, setProviderTestBusy] = useState(false)
+  const [providerTestMessage, setProviderTestMessage] = useState('')
   const [activeSource, setActiveSource] = useState('code')
   const [notice, setNotice] = useState(() => {
     const authResult = new URLSearchParams(window.location.search).get('auth')
@@ -260,6 +325,8 @@ function App() {
     setSelectedId(id)
     setCurrentSource(null)
     setSourceError('')
+    setEditorPath(null)
+    setEditorDraft(null)
   }, [])
 
   useEffect(() => {
@@ -320,27 +387,27 @@ function App() {
   }, [assistantSettings])
 
   useEffect(() => {
-    if (!activeRepository) return
+    if (!repositoryOwner || !repositoryName) return
     let active = true
-    void getRepositoryGraph(activeRepository.owner, activeRepository.repository, mode).then((graph) => {
+    void getRepositoryGraph(repositoryOwner, repositoryName, mode).then((graph) => {
       if (!active) return
       setLiveGraph(graph)
       const branch = graph.repository.default_branch
       if (typeof branch === 'string') setActiveRepository((current) => current ? { ...current, branch } : current)
-      setCurrentSource(null)
+      setCurrentSource((source) => source && graph.nodes.some((node) => node.kind === 'file' && node.path === source.path) ? source : null)
       setSourceError('')
       const firstNode = graph.nodes.find((node) => node.kind === 'file') ?? graph.nodes[0]
-      if (firstNode) setSelectedId(firstNode.id)
+      if (firstNode) setSelectedId((current) => graph.nodes.some((node) => node.id === current) ? current : firstNode.id)
     }).catch((error: unknown) => {
       if (active) setNotice(error instanceof Error ? error.message : 'The repository graph could not be loaded.')
     }).finally(() => { if (active) setGraphLoading(false) })
     return () => { active = false }
-  }, [activeRepository, mode])
+  }, [repositoryOwner, repositoryName, mode])
 
   useEffect(() => {
-    if (!activeRepository || !selected?.path || selected.kind !== 'file') return
+    if (!repositoryOwner || !repositoryName || !selected?.path || selected.kind !== 'file') return
     let active = true
-    void getRepositoryFile(activeRepository.owner, activeRepository.repository, selected.path).then((source) => {
+    void getRepositoryFile(repositoryOwner, repositoryName, selected.path).then((source) => {
       if (active) setCurrentSource(source)
     }).catch((error: unknown) => {
       if (active) {
@@ -349,7 +416,7 @@ function App() {
       }
     })
     return () => { active = false }
-  }, [activeRepository, selected?.id, selected?.kind, selected?.path])
+  }, [repositoryOwner, repositoryName, selected?.id, selected?.kind, selected?.path])
 
   const handleSubmitRepo = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -576,6 +643,17 @@ function App() {
     }
   }
 
+  const handleTestProvider = async () => {
+    setProviderTestBusy(true)
+    setProviderTestMessage('Testing connection without repository data…')
+    try {
+      const result = await testModelConnection(assistantSettings)
+      setProviderTestMessage(result)
+    } catch (error) {
+      setProviderTestMessage(error instanceof Error ? error.message : 'The provider connection could not be tested.')
+    } finally { setProviderTestBusy(false) }
+  }
+
   const submitQuestion = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const text = question.trim()
@@ -588,7 +666,9 @@ function App() {
       setAssistantBusy(true)
       try {
         const evidenceGraph = await getRepositoryGraph(activeRepository.owner, activeRepository.repository, 'decisions')
-        const relevantSource = currentSource?.path === selected.path ? currentSource : null
+        const relevantSource = currentSource && currentSource.path === selected.path
+          ? { ...currentSource, content: editorDraft?.path === currentSource.path ? editorDraft.content : currentSource.content }
+          : null
         const answer = await askWithEvidence(assistantSettings, text, evidenceGraph, selected.id, relevantSource)
         setChat((current) => [...current, { role: 'assistant', text: answer.answer, citations: answer.citations, confidence: answer.confidence }])
       } catch (error) {
@@ -612,10 +692,7 @@ function App() {
 
   const switchGraphMode = (nextMode: GraphMode) => {
     if (nextMode === mode) return
-    if (activeRepository) {
-      setGraphLoading(true)
-      setLiveGraph({ repository: {}, nodes: [], edges: [], coverage: {} })
-    }
+    if (activeRepository) setGraphLoading(true)
     setMode(nextMode)
   }
 
@@ -641,6 +718,20 @@ function App() {
     ? selected?.kind === 'file' && typeof selected.path === 'string' ? selected.path : undefined
     : 'packages/next/src/server/config-shared.ts'
   const previewName = previewPath?.split('/').pop() ?? 'Select a file'
+  const editorOriginal = currentSource && currentSource.path === selected?.path ? currentSource.content : ''
+  const selectedDraft = editorDraft && editorDraft.path === selected?.path ? editorDraft.content : null
+  const editorOpen = Boolean(selected?.path && editorPath === selected.path)
+  const editorText = selectedDraft ?? editorOriginal
+  const editorChanges = useMemo(() => changedLineCounts(editorOriginal, editorText), [editorOriginal, editorText])
+  const editorDirty = editorText !== editorOriginal
+  const openSourceEditor = () => {
+    if (!currentSource || currentSource.path !== selected?.path) {
+      setNotice('Wait for the selected source file to finish loading, then open the editor.')
+      return
+    }
+    setEditorDraft((draft) => draft?.path === currentSource.path ? draft : { path: currentSource.path, content: currentSource.content })
+    setEditorPath(currentSource.path)
+  }
 
   return (
     <main className="app-shell">
@@ -729,8 +820,8 @@ function App() {
           {showInspector && <aside className="inspector">
             <div className="inspector-tabs"><button className={activeSource === 'code' ? 'active' : ''} onClick={() => setActiveSource('code')}>Explore</button><button className={activeSource === 'assistant' ? 'active' : ''} onClick={() => setActiveSource('assistant')}>Assistant <Sparkle size={13} /></button><button className="inspector-close" aria-label="Close panel" onClick={() => setShowInspector(false)}><X size={16} /></button></div>
             {activeSource === 'assistant' ? <div className="assistant-panel">
-              <div className="assistant-intro"><div className="assistant-mark"><Sparkle size={17} /></div><div><b>Repository assistant</b><small>{activeRepository ? 'BYOK · cited repository evidence' : 'Illustrative sample mode'}</small></div><button className="assistant-settings-button" aria-label="Model settings" title="Model settings" onClick={() => setShowAssistantSettings((open) => !open)}><GearSix size={16} /></button><span className="offline-pill">{activeRepository ? 'BYOK' : 'PREVIEW'}</span></div>
-              {showAssistantSettings && <form className="assistant-settings" onSubmit={(event) => { event.preventDefault(); setShowAssistantSettings(false); setNotice('Model settings are saved for this browser tab only.') }}><div className="settings-heading"><b>Connect your model</b><button type="button" aria-label="Close model settings" onClick={() => setShowAssistantSettings(false)}><X size={14} /></button></div><label>OpenAI-compatible API URL<input value={assistantSettings.endpoint} onChange={(event) => setAssistantSettings((settings) => ({ ...settings, endpoint: event.target.value }))} placeholder="https://api.openai.com/v1" autoComplete="url" /></label><label>Model name<input value={assistantSettings.model} onChange={(event) => setAssistantSettings((settings) => ({ ...settings, model: event.target.value }))} placeholder="gpt-4o-mini" autoComplete="off" /></label><label>API key<input type="password" value={assistantSettings.apiKey} onChange={(event) => setAssistantSettings((settings) => ({ ...settings, apiKey: event.target.value }))} placeholder="Paste your provider key" autoComplete="new-password" /></label><p>Your key stays in this tab and goes directly from your browser to the provider. It is never sent to this app’s API.</p><button className="settings-save" type="submit">Save for this tab</button></form>}
+              <div className="assistant-intro"><div className="assistant-mark"><Sparkle size={17} /></div><div><b>Repository assistant</b><small>{activeRepository ? 'BYOK · cited repository evidence' : 'Illustrative sample mode'}</small></div><button className="assistant-settings-button" aria-label="Model settings" title="Model settings" onClick={() => setShowAssistantSettings((open) => !open)}><GearSix size={16} /></button><span className="offline-pill">{!activeRepository ? 'PREVIEW' : assistantSettings.apiKey && assistantSettings.model ? 'CONNECTED' : 'SET UP KEY'}</span></div>
+              {showAssistantSettings && <form className="assistant-settings" onSubmit={(event) => { event.preventDefault(); setShowAssistantSettings(false); setNotice('Model settings are saved for this browser tab only.') }}><div className="settings-heading"><b>Connect your model</b><button type="button" aria-label="Close model settings" onClick={() => setShowAssistantSettings(false)}><X size={14} /></button></div><label>OpenAI-compatible API URL<input value={assistantSettings.endpoint} onChange={(event) => { setAssistantSettings((settings) => ({ ...settings, endpoint: event.target.value })); setProviderTestMessage('') }} placeholder="https://api.provider.com/v1" autoComplete="url" /></label><label>Model ID from your provider<input value={assistantSettings.model} onChange={(event) => { setAssistantSettings((settings) => ({ ...settings, model: event.target.value })); setProviderTestMessage('') }} placeholder="model-id-from-provider" autoComplete="off" /></label><label>API key<input type="password" value={assistantSettings.apiKey} onChange={(event) => { setAssistantSettings((settings) => ({ ...settings, apiKey: event.target.value })); setProviderTestMessage('') }} placeholder="Paste your provider key" autoComplete="new-password" /></label><p>Use the provider’s base URL and exact model ID. Your key stays in this tab and goes directly from your browser to the provider. It is never sent to this app’s API. The provider must allow browser requests from this site (CORS).</p><div className="provider-test-actions"><button type="button" className="settings-test" onClick={() => void handleTestProvider()} disabled={providerTestBusy}>{providerTestBusy ? 'Testing…' : 'Test connection'}</button><button className="settings-save" type="submit">Save for this tab</button></div>{providerTestMessage && <p className="provider-test-message" role="status">{providerTestMessage}</p>}</form>}
               <div className="assistant-context"><span className="context-icon"><Code size={14} /></span><span>Context <b>{selected?.label ?? 'Repository'}</b></span><button aria-label="Clear context" onClick={() => setSelectedId('repo')}><X size={13} /></button></div>
               <div className="chat-messages">{chat.map((message, index) => <div className={`chat-message ${message.role}`} key={`${message.role}-${index}`}><div className="chat-avatar">{message.role === 'assistant' ? <Sparkle size={13} /> : 'Y'}</div><div className="chat-content"><p>{message.text}</p>{message.confidence && <span className={`confidence-badge confidence-${message.confidence}`}>{message.confidence} confidence</span>}{message.sources?.map((source) => <div className="source-chip" key={source}><BookOpenText size={13} /> {source}</div>)}{message.citations?.map((citation) => <a className="source-chip" href={citationHref(citation, activeRepository)} target="_blank" rel="noreferrer" key={citation.id}><BookOpenText size={13} /> {citation.kind.toUpperCase()} · {citation.label}</a>)}</div></div>)}{assistantBusy && <div className="assistant-thinking" role="status"><span className="loading-ring" /> Reviewing connected evidence…</div>}</div>
               <div className="suggested-questions"><span>TRY ASKING</span>{['Why does this file exist?', 'What changed this behavior?'].map((suggestion) => <button key={suggestion} onClick={() => setQuestion(suggestion)}>{suggestion}<ArrowRight size={13} /></button>)}</div>
@@ -745,12 +836,13 @@ function App() {
               {selected?.path && <button className="path-link" onClick={() => openGitHub(selected.path ?? undefined)}><Code size={14} /><span>{selected.path}</span><ArrowRight size={13} /></button>}
               {selected?.date && <div className="entity-meta"><span>DATE</span><b>{selected.date}</b></div>}
               {selected?.author && <div className="entity-meta"><span>{selected.kind === 'person' ? 'IDENTITY' : 'AUTHOR'}</span><b>{selected.author}</b></div>}
-              <div className="code-card"><div className="code-card-head"><span><FileCode size={13} /> {previewName}</span><button disabled={!previewPath} onClick={() => openGitHub(previewPath)}>OPEN FILE <ArrowRight size={12} /></button></div><div className="code-content">{sourceLines.length ? sourceLines.map(([line, code, kind]) => <div className="code-line" key={line}><span className="line-number">{line}</span><code className={kind}>{code || ' '}</code></div>) : <div className="source-state">{sourceError || (graphLoading ? 'Loading the selected file…' : previewPath ? 'Loading source from GitHub…' : 'Select a file node to preview its contents.')}</div>}</div><div className="code-card-foot"><span>{sourceLines.length ? `${sourceLines.length} LINES SHOWN${currentSource?.truncated ? ' · FILE TRUNCATED' : ''}` : 'SOURCE PREVIEW'}</span><button disabled={!previewPath} onClick={() => openGitHub(previewPath)}>VIEW ON GITHUB <ArrowRight size={12} /></button></div></div>
+              <div className="code-card"><div className="code-card-head"><span><FileCode size={13} /> {previewName}</span><div><button disabled={!currentSource || currentSource.path !== previewPath} onClick={openSourceEditor}>EDIT DRAFT</button><button disabled={!previewPath} onClick={() => openGitHub(previewPath)}>OPEN FILE <ArrowRight size={12} /></button></div></div><div className="code-content">{sourceLines.length ? sourceLines.map(([line, code, kind]) => <div className="code-line" key={line}><span className="line-number">{line}</span><code className={kind}>{code || ' '}</code></div>) : <div className="source-state">{sourceError || (graphLoading ? 'Loading the selected file…' : previewPath ? 'Loading source from GitHub…' : 'Select a file node to preview its contents.')}</div>}</div><div className="code-card-foot"><span>{sourceLines.length ? `${sourceLines.length} LINES PREVIEWED${currentSource?.truncated ? ' · FILE TRUNCATED' : ''}` : 'SOURCE PREVIEW'}</span><button disabled={!previewPath} onClick={() => openGitHub(previewPath)}>VIEW ON GITHUB <ArrowRight size={12} /></button></div></div>
               <div className="evidence-preview"><div className="evidence-head"><span><span className="evidence-mark"><GitCommit size={13} /></span> {activeRepository ? 'CONNECTED GRAPH NODES' : 'HISTORY CONNECTIONS'}</span><span>{activeRepository ? connectedNodes.length : 2}</span></div>{activeRepository ? connectedNodes.length ? connectedNodes.slice(0, 8).map((node) => <button key={node.id} onClick={() => setSelectedId(node.id)}><span className="evidence-type">{node.kind.toUpperCase()}</span><span className="evidence-title">{node.label}</span><span className="evidence-sub">{node.date ?? node.description ?? 'Connected in the indexed graph'}</span><ArrowRight size={14} /></button>) : <p className="source-state">No connected records are present in this graph view.</p> : <><button onClick={() => switchGraphMode('decisions')}><span className="evidence-type">COMMIT</span><span className="evidence-title">Introduce shared defaults</span><span className="evidence-sub">Illustrative sample</span><ArrowRight size={14} /></button><button onClick={() => switchGraphMode('decisions')}><span className="evidence-type issue-type">ISSUE</span><span className="evidence-title">Inconsistent config behavior</span><span className="evidence-sub">Illustrative sample</span><ArrowRight size={14} /></button></>}</div>
               <button className="ask-why-button" onClick={() => setActiveSource('assistant')}><Sparkle size={15} /> Ask why this exists <ArrowRight size={14} /></button>
               <div className="provenance-note"><ShieldCheck size={14} /><span>{activeRepository ? 'Supersession links appear only when later pull request text explicitly names an older pull request as replaced. Missing links do not prove a decision is current.' : 'Sample content is illustrative. Linked sources are not asserted as factual history.'}</span></div>
             </div>}
-          </aside>}{!showInspector && <button className="inspector-reopen" onClick={() => setShowInspector(true)}>Show details panel <ArrowRight size={14} /></button>}
+          </aside>}{!showInspector && <button className="inspector-reopen" onClick={() => setShowInspector(true)}>Show details panel <ArrowRight size={14} /> </button>}
+          {editorOpen && <section className="editor-overlay" aria-label="Unsaved file editor"><header className="editor-header"><div><span>LOCAL DRAFT · READ ONLY SOURCE</span><b>{selected?.path}</b></div><div><span>{editorText.split('\n').length.toLocaleString()} lines{currentSource?.truncated ? ' · fetched file is truncated at the safety limit' : ''}</span><button onClick={() => setEditorPath(null)} aria-label="Close editor"><X size={16} /></button></div></header><div className="editor-body"><div className="editor-column"><pre className="editor-gutter" aria-hidden="true" style={{ transform: `translateY(-${editorScrollTop}px)` }}>{editorText.split('\n').map((_, index) => index + 1).join('\n')}</pre><textarea className="source-editor" aria-label="Editable local source draft" value={editorText} onChange={(event) => setEditorDraft({ path: selected?.path ?? '', content: event.target.value })} onScroll={(event) => setEditorScrollTop(event.currentTarget.scrollTop)} onKeyDown={(event) => { if (event.key === 'Escape') setEditorPath(null); if (event.key === 'Tab') { event.preventDefault(); const input = event.currentTarget; input.setRangeText('    ', input.selectionStart, input.selectionEnd, 'end'); setEditorDraft({ path: selected?.path ?? '', content: input.value }) } }} spellCheck={false} autoCapitalize="off" autoComplete="off" autoCorrect="off" wrap="off" /></div><aside className="editor-impact"><span className="editor-eyebrow">CHANGE PREVIEW</span><h3>{editorDirty ? 'Unsaved draft changes' : 'No draft changes yet'}</h3><div className="draft-diff"><span><b>+{editorChanges.added}</b> approx. lines added</span><span><b>−{editorChanges.removed}</b> approx. lines removed</span></div><p>This is a local draft. Nothing is written to GitHub, Neo4j, or run by this app. The links below are known graph connections, not a runtime prediction.</p>{currentSource?.truncated && <p className="editor-warning">Only the first part of this large file was fetched. The draft cannot represent its unseen remainder.</p>}<button className="editor-ask" disabled={!editorDirty} onClick={() => { setQuestion('What could this unsaved code change affect? Explain only what the draft and connected repository evidence support.'); setActiveSource('assistant'); setEditorPath(null) }}><Sparkle size={14} /> Ask AI about this draft</button><p className="editor-consent-note">The assistant receives up to 8,000 characters of the draft only after you enable provider sharing and send your question.</p><h4>Known graph connections · {connectedNodes.length}</h4>{connectedNodes.length ? connectedNodes.slice(0, 12).map((node) => <div className="editor-impact-node" key={node.id}><span>{node.kind.toUpperCase()}</span><b>{node.label}</b></div>) : <div className="source-state">No related nodes are present in this graph view.</div>}<button className="editor-reset" disabled={!editorDirty} onClick={() => setEditorDraft(null)}>Reset to indexed source</button></aside></div></section>}
         </div>
       </section>}
       {notice && workspace && <div className="toast" role="status"><CheckCircle size={16} />{notice}<button aria-label="Dismiss notification" onClick={() => setNotice('')}><X size={14} /></button></div>}

@@ -45,6 +45,27 @@ function safeEndpoint(value: string) {
   return `${url.origin}${url.pathname.replace(/\/+$/, '')}/chat/completions`
 }
 
+export async function testModelConnection(settings: AssistantSettings): Promise<string> {
+  if (!settings.apiKey.trim() || !settings.model.trim()) throw new Error('Enter the provider model ID and API key first.')
+  const response = await fetch(safeEndpoint(settings.endpoint), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.apiKey}` },
+    body: JSON.stringify({ model: settings.model.trim(), temperature: 0, max_tokens: 8, messages: [{ role: 'user', content: 'Reply with OK.' }] }),
+    signal: AbortSignal.timeout(20_000),
+  }).catch(() => { throw new Error('Could not reach the model provider. Check the URL, network, and whether its CORS settings allow browser requests. No repository data was sent.') })
+  if (!response.ok) {
+    const data: unknown = await response.json().catch(() => null)
+    const message = typeof data === 'object' && data !== null && 'error' in data && typeof data.error === 'object' && data.error !== null && 'message' in data.error && typeof data.error.message === 'string'
+      ? data.error.message.slice(0, 240)
+      : `The provider returned HTTP ${response.status}.`
+    throw new Error(message)
+  }
+  const data: unknown = await response.json().catch(() => null)
+  const reply = typeof data === 'object' && data !== null && 'choices' in data && Array.isArray(data.choices) ? data.choices[0]?.message?.content : null
+  if (typeof reply !== 'string') throw new Error('The provider responded, but its API format is not OpenAI-compatible chat completions.')
+  return 'Connection successful. No repository data was sent.'
+}
+
 export async function askWithEvidence(settings: AssistantSettings, question: string, graph: RepositoryGraphData, selectedId: string, source: RepositorySource | null): Promise<EvidenceAnswer> {
   if (!settings.apiKey.trim() || !settings.model.trim()) throw new Error('Add a model name and API key in assistant settings first.')
   const evidence = getEvidence(graph, selectedId, source)
