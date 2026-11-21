@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     smtp_username: str = ""
     smtp_password: str = ""
     smtp_from: str = ""
+    brevo_api_key: str = ""
+    brevo_from: str = ""
     frontend_url: str = "http://127.0.0.1:5173/"
     github_api_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
     max_indexed_files: int = Field(default=1800, ge=100, le=10_000)
@@ -59,7 +61,10 @@ class Settings(BaseSettings):
 
     @property
     def email_auth_configured(self) -> bool:
-        return bool(self.smtp_host and self.smtp_username and self.smtp_password)
+        return bool(
+            (self.brevo_api_key and self.brevo_from)
+            or (self.smtp_host and self.smtp_username and self.smtp_password)
+        )
 
 
 @lru_cache

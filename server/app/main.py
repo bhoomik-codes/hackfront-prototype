@@ -662,14 +662,32 @@ def _email_auth_throttle(request: Request, email: str, purpose: str) -> None:
 
 async def _send_auth_code(email: str, code: str) -> None:
     try:
-        await asyncio.to_thread(_send_email_code, email, code)
+        if settings.brevo_api_key and settings.brevo_from:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(
+                    "https://api.brevo.com/v3/smtp/email",
+                    headers={"api-key": settings.brevo_api_key, "accept": "application/json"},
+                    json={
+                        "sender": {"name": "Why", "email": settings.brevo_from},
+                        "to": [{"email": email}],
+                        "subject": "Your Why verification code",
+                        "textContent": (
+                            f"Your Why verification code is {code}. It expires in 10 minutes. "
+                            "If you did not request this code, you can ignore this email."
+                        ),
+                    },
+                )
+                response.raise_for_status()
+        else:
+            await asyncio.to_thread(_send_email_code, email, code)
     except Exception as error:
-        logger.warning("Email verification delivery failed (%s)", type(error).__name__)
+        logger.warning("Email verification delivery failed via %s (%s)",
+                       "Brevo HTTPS" if settings.brevo_api_key else "SMTP", type(error).__name__)
         raise HTTPException(
             status_code=502,
             detail={
                 "code": "email_delivery_failed",
-                "message": "The verification email could not be sent. Check the SMTP settings and try again later.",
+                "message": "The verification email could not be sent. Check the email provider settings and try again later.",
             },
         ) from error
 
