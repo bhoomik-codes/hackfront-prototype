@@ -287,7 +287,7 @@ function GraphCanvas({ mode, query, graphData, onSelect, selectedId, filters, on
     if (selectedId && graph.current.getElementById(selectedId).length) graph.current.getElementById(selectedId).select()
   }, [selectedId, graphInstanceVersion])
 
-  return <div className="graph-canvas" ref={host} aria-label={`${mode === 'architecture' ? 'Code structure' : 'Decision history'} graph`}>{loadError && <div className="graph-error" role="status">The graph view could not load. Refresh the workspace to try again.</div>}</div>
+  return <div className="graph-canvas" ref={host} role="region" aria-label={`${mode === 'architecture' ? 'Code structure' : 'Decision history'} graph`}>{loadError && <div className="graph-error" role="status">The graph view could not load. Refresh the workspace to try again.</div>}</div>
 }
 
 function App() {

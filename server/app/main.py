@@ -223,6 +223,12 @@ async def _call_if_identity_active(request: Request, call_next):
     return await call_next(request)
 
 
+def _with_transport_security(response: Response) -> Response:
+    if settings.frontend_url.startswith("https://"):
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    return response
+
+
 @app.middleware("http")
 async def secure_api_response(request: Request, call_next):
     if not request.url.path.startswith("/api/"):
@@ -239,7 +245,7 @@ async def secure_api_response(request: Request, call_next):
             "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; "
             "form-action 'self' https://github.com"
         )
-        return response
+        return _with_transport_security(response)
     client_key = request.client.host if request.client else "unknown-client"
     now = time.monotonic()
     requests = request.app.state.request_limits[client_key]
@@ -323,7 +329,7 @@ async def secure_api_response(request: Request, call_next):
         "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
     )
     response.headers["Cache-Control"] = "no-store"
-    return response
+    return _with_transport_security(response)
 
 
 def _owner_key(request: Request) -> str:

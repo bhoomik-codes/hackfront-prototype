@@ -1,0 +1,3 @@
+User-agent: *
+Disallow: /api/
+Sitemap: https://why-the-code-bhoomik-kqe7.onrender.com/sitemap.xml
